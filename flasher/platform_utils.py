@@ -32,6 +32,13 @@ def host_arch() -> str:
     return m or "unknown"
 
 
+def subprocess_flags() -> dict:
+    """Return platform-specific subprocess kwargs to avoid flashing console windows on Windows."""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
+
 @lru_cache(maxsize=32)
 def probe_executable(path: str, test_args: tuple = ("--version",)) -> bool:
     if not path or not os.path.isfile(path):
@@ -49,6 +56,7 @@ def probe_executable(path: str, test_args: tuple = ("--version",)) -> bool:
             stderr=subprocess.DEVNULL,
             timeout=5,
             check=False,
+            **subprocess_flags(),
         )
         return proc.returncode == 0
     except (OSError, subprocess.SubprocessError):

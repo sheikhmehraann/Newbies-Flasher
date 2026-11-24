@@ -605,6 +605,7 @@ class NewbiesFlasherApp:
         )
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 6))
         self.path_entry.bind("<KeyRelease>", self._schedule_scan)
+        self.path_entry.bind("<Return>", lambda _e: self._trigger_scan_now())
 
         tree_wrap = tk.Frame(left_card, bg=self.SURFACE)
         tree_wrap.grid(row=2, column=0, sticky="nsew")
@@ -964,12 +965,12 @@ class NewbiesFlasherApp:
     def _update_zip_ui(self, lvl: int) -> None:
         zstd_on = self.zstd_var.get() > 0
         if zstd_on:
-            note = "Store" if lvl == 0 else "Scripts only"
+            note = "Store" if lvl == 0 else ("Fast" if lvl == 1 else ("Max" if lvl == 9 else f"Deflate {lvl}"))
             self.zip_title_lbl.config(text="ZIP Level (.zst stored)")
             self.zip_lbl.config(text=f"Level {lvl} ({note})", fg=self.MUTED)
             self.zip_slider.set_fill_color("#3e485c")
         else:
-            note = "Store" if lvl == 0 else ("Fast" if lvl == 1 else f"Deflate {lvl}")
+            note = "Store" if lvl == 0 else ("Fast" if lvl == 1 else ("Max" if lvl == 9 else f"Deflate {lvl}"))
             self.zip_title_lbl.config(text="ZIP Level (raw images)")
             self.zip_lbl.config(text=f"Level {lvl} ({note})", fg=self.ACCENT_HOVER)
             self.zip_slider.set_fill_color(self.ACCENT)

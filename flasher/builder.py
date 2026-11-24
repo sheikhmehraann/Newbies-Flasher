@@ -17,6 +17,7 @@ from .platform_utils import (
     get_device_binaries,
     get_host_zstd,
     has_python_zstandard,
+    subprocess_flags,
 )
 from .recovery_script import generate_update_binary
 from .sparse import get_sparse_uncompressed_size, unsparse_image, unsparse_to_stream
@@ -24,6 +25,7 @@ from .sparse import get_sparse_uncompressed_size, unsparse_image, unsparse_to_st
 ZIP64_THRESHOLD = 0xFFFFFFFF - (16 * 1024 * 1024)
 COPY_BUF = 16 * 1024 * 1024
 ZIP_WRITE_BUF = 4 * 1024 * 1024
+PIPE_BUF = 1 * 1024 * 1024
 LARGE_IMAGE_BYTES = 64 * 1024 * 1024
 ALREADY_COMPRESSED_EXTS = (".zst", ".gz", ".xz", ".bz2", ".lz4", ".zip")
 
@@ -93,6 +95,20 @@ def sanitize_output_path(output_zip: str) -> str:
     return os.path.join(out_dir, clean_base) if out_dir else clean_base
 
 
+def _write_all(fh, data: memoryview) -> None:
+    """Loop until the entire buffer is written so pipe short-writes never truncate streams."""
+    view = memoryview(data)
+    total = len(view)
+    sent = 0
+    while sent < total:
+        n = fh.write(view[sent:])
+        if n is None:
+            return
+        if n <= 0:
+            raise OSError("Short write to zstd pipe")
+        sent += n
+
+
 def _wait_proc(proc: subprocess.Popen, cancel_event: Optional[threading.Event]) -> Tuple[int, bytes]:
     while True:
         if cancel_event and cancel_event.is_set():
@@ -112,6 +128,18 @@ def _wait_proc(proc: subprocess.Popen, cancel_event: Optional[threading.Event]) 
     return proc.returncode, err_bytes
 
 
+def _zstd_cli_args(zstd_bin: str, level: int, threads: int, stream_size: int = 0) -> List[str]:
+    eff_threads = min(threads, 4) if level >= 20 else threads
+    args = [zstd_bin, f"-T{max(1, eff_threads)}", "-f", "-q"]
+    if stream_size > 0:
+        args.append(f"--stream-size={stream_size}")
+    if level >= 20:
+        args.extend([f"-{min(22, level)}", "--ultra"])
+    else:
+        args.append(f"-{max(1, level)}")
+    return args
+
+
 def _run_zstd_compress(
     src: str,
     dst: str,
@@ -124,20 +152,23 @@ def _run_zstd_compress(
         raise RuntimeError("Build cancelled")
 
     if zstd_bin:
-        args = [zstd_bin, f"-T{threads}", "-f", "-q"]
-        if level >= 20:
-            args.extend([f"-{level}", "--ultra"])
-        else:
-            args.append(f"-{max(1, level)}")
-        args.extend([src, "-o", dst])
-
-        with subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as proc:
-            rc, err_bytes = _wait_proc(proc, cancel_event)
-        if rc == 0 and os.path.isfile(dst):
-            return
-        err = err_bytes.decode("utf-8", errors="replace").strip()
+        # Retry once with -T1 if ultra-level multi-threaded compression runs short on host RAM.
+        attempts = [threads] + ([1] if (level >= 20 and threads > 1) else [])
+        last_err = ""
+        for t_cnt in attempts:
+            args = _zstd_cli_args(zstd_bin, level, t_cnt) + [src, "-o", dst]
+            with subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **subprocess_flags()) as proc:
+                rc, err_bytes = _wait_proc(proc, cancel_event)
+            if rc == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                return
+            last_err = err_bytes.decode("utf-8", errors="replace").strip()
+            if os.path.exists(dst):
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
         if not has_python_zstandard():
-            raise RuntimeError(f"zstd compression failed for {os.path.basename(src)}: {err}")
+            raise RuntimeError(f"zstd compression failed for {os.path.basename(src)}: {last_err}")
 
     try:
         import zstandard
@@ -147,8 +178,9 @@ def _run_zstd_compress(
         ) from exc
 
     c_level = max(1, min(level, 22))
+    py_threads = 1 if c_level >= 20 else threads
     try:
-        cctx = zstandard.ZstdCompressor(level=c_level, threads=threads, write_checksum=True, write_content_size=True)
+        cctx = zstandard.ZstdCompressor(level=c_level, threads=py_threads, write_checksum=True, write_content_size=True)
     except TypeError:
         cctx = zstandard.ZstdCompressor(level=c_level, write_checksum=True, write_content_size=True)
     src_size = os.path.getsize(src)
@@ -179,33 +211,29 @@ def _run_sparse_to_zstd(
     expected_sz = get_sparse_uncompressed_size(src) or 0
 
     if zstd_bin and expected_sz > 0:
-        args = [zstd_bin, f"-T{threads}", f"--stream-size={expected_sz}", "-f", "-q"]
-        if level >= 20:
-            args.extend([f"-{level}", "--ultra"])
-        else:
-            args.append(f"-{max(1, level)}")
-        args.extend(["-o", dst])
-
+        args = _zstd_cli_args(zstd_bin, level, threads, stream_size=expected_sz) + ["-o", dst]
         try:
             with subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                bufsize=0,
+                bufsize=PIPE_BUF,
+                **subprocess_flags(),
             ) as proc:
                 assert proc.stdin is not None
                 try:
-                    raw_sz = unsparse_to_stream(src, proc.stdin.write, cancel_check=cancel_check)
+                    raw_sz = unsparse_to_stream(src, lambda mv: _write_all(proc.stdin, mv), cancel_check=cancel_check)
+                    proc.stdin.flush()
                 finally:
                     try:
                         proc.stdin.close()
                     except OSError:
                         pass
                 rc, _ = _wait_proc(proc, cancel_event)
-            if rc == 0 and os.path.isfile(dst):
+            if rc == 0 and raw_sz == expected_sz and os.path.isfile(dst) and os.path.getsize(dst) > 0:
                 return raw_sz
-        except BrokenPipeError:
+        except OSError:
             pass
         if os.path.exists(dst):
             try:
@@ -216,15 +244,16 @@ def _run_sparse_to_zstd(
     if not zstd_bin and has_python_zstandard() and expected_sz > 0:
         import zstandard
         c_level = max(1, min(level, 22))
+        py_threads = 1 if c_level >= 20 else threads
         try:
-            cctx = zstandard.ZstdCompressor(level=c_level, threads=threads, write_checksum=True, write_content_size=True)
+            cctx = zstandard.ZstdCompressor(level=c_level, threads=py_threads, write_checksum=True, write_content_size=True)
         except TypeError:
             cctx = zstandard.ZstdCompressor(level=c_level, write_checksum=True, write_content_size=True)
         with open(dst, "wb") as ofh:
             with cctx.stream_writer(ofh, size=expected_sz, closefd=False) as writer:
                 return unsparse_to_stream(src, writer.write, cancel_check=cancel_check)
 
-    # Fallback if an old system zstd does not support --stream-size.
+    # Fallback if an old system zstd does not support --stream-size or hits a pipe error.
     tmp_raw = os.path.join(stage_dir, f"{os.path.basename(dst)}.raw")
     try:
         raw_sz = unsparse_image(src, tmp_raw, cancel_check=cancel_check)
@@ -252,11 +281,17 @@ def _run_zstd_decompress(
             [zstd_bin, "-d", "-f", "-q", src, "-o", dst],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            **subprocess_flags(),
         ) as proc:
             rc, err_bytes = _wait_proc(proc, cancel_event)
-        if rc == 0 and os.path.isfile(dst):
+        if rc == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
             return os.path.getsize(dst)
         err = err_bytes.decode("utf-8", errors="replace").strip()
+        if os.path.exists(dst):
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
         if not has_python_zstandard():
             raise RuntimeError(f"zstd decompression failed for {os.path.basename(src)}: {err}")
 
@@ -325,7 +360,7 @@ class _StreamingZipWriter:
         cancel_event: Optional[threading.Event],
     ):
         self.output_zip = output_zip
-        self.zip_level = zip_level
+        self.zip_level = max(0, min(9, int(zip_level)))
         self.cancel_event = cancel_event
         self.written_bytes = 0
         self.start_ts = time.monotonic()
@@ -343,7 +378,7 @@ class _StreamingZipWriter:
         if os.path.exists(self.output_zip):
             os.remove(self.output_zip)
         default_comp = zipfile.ZIP_STORED if self.zip_level <= 0 else zipfile.ZIP_DEFLATED
-        zip_kwargs = {"compresslevel": min(9, self.zip_level)} if self.zip_level > 0 else {}
+        zip_kwargs = {"compresslevel": self.zip_level} if self.zip_level > 0 else {}
         self._fh = open(self.output_zip, "wb", buffering=ZIP_WRITE_BUF)
         self._zf = zipfile.ZipFile(self._fh, "w", compression=default_comp, allowZip64=True, **zip_kwargs)
         return self
@@ -381,6 +416,7 @@ class _StreamingZipWriter:
         total_est_bytes: int = 0,
     ) -> int:
         assert self._zf is not None
+        assert self._fh is not None
         if self.cancel_event and self.cancel_event.is_set():
             raise RuntimeError("Build cancelled")
 
@@ -394,11 +430,14 @@ class _StreamingZipWriter:
         zinfo = zipfile.ZipInfo(filename=arc)
         zinfo.date_time = time.localtime(st.st_mtime)[:6]
         zinfo.compress_type = comp_type
+        # Python's ZipFile.open(ZipInfo) reads zinfo._compresslevel rather than ZipFile.compresslevel.
+        zinfo._compresslevel = self.zip_level if comp_type == zipfile.ZIP_DEFLATED else None
         zinfo.create_system = 3
         zinfo.file_size = sz
         zinfo.external_attr = (0o100755 if is_exec else 0o100644) << 16
 
-        use_zip64 = sz >= ZIP64_THRESHOLD or (self.written_bytes + sz) >= ZIP64_THRESHOLD
+        cur_offset = self._fh.tell()
+        use_zip64 = sz >= ZIP64_THRESHOLD or (cur_offset + sz) >= ZIP64_THRESHOLD
         with open(fp, "rb") as src_f, self._zf.open(zinfo, mode="w", force_zip64=use_zip64) as dst_f:
             while True:
                 if self.cancel_event and self.cancel_event.is_set():
@@ -456,12 +495,22 @@ def build_package(
     if not selected:
         raise ValueError("No partition images selected for packaging.")
 
+    needs_zstd = (
+        (use_zstd and any(p.fmt != "zstd" for p in selected))
+        or (not use_zstd and any(p.fmt == "zstd" for p in selected))
+        or (cfg.vbmeta_mode in ("disable", "enable") and any(p.fmt == "zstd" and is_top_level_vbmeta(p.name) for p in selected))
+    )
+    if needs_zstd and not zstd_bin and not has_python_zstandard():
+        raise RuntimeError(
+            "zstd is not available on this system. Install zstd (or set ZSTD level to 0 for raw images)."
+        )
+
     output_zip = sanitize_output_path(cfg.output_zip)
     log(f"Target: {cfg.device} ({cfg.codename or 'any'}) | Version: {cfg.version}")
     log(f"Selected {len(selected)} image(s) | ZSTD: {cfg.zstd_level} | ZIP: {cfg.zip_level}")
     if zstd_bin:
         log(f"zstd binary: {zstd_bin}")
-    elif use_zstd or any(p.fmt == "zstd" for p in selected):
+    elif needs_zstd:
         log("Using Python zstandard fallback")
 
     stage_dir = tempfile.mkdtemp(prefix="newbies_flasher_stage_")
@@ -529,7 +578,7 @@ def build_package(
         completed_work = 0
 
         if small_comp_jobs:
-            workers = min(len(small_comp_jobs), total_cpus)
+            workers = min(len(small_comp_jobs), 2 if cfg.zstd_level >= 20 else total_cpus)
             log(f"Compressing {len(small_comp_jobs)} image(s) ({workers} worker x 1 thread)...")
 
             def _do_small(job):
@@ -684,8 +733,11 @@ def build_package(
             # Start compressing large partitions in background WHILE packing META-INF + small images.
             if large_comp_jobs:
                 large_comp_jobs.sort(key=lambda item: item[3], reverse=True)
-                l_workers = min(len(large_comp_jobs), 2 if total_cpus >= 4 else 1)
+                # Ultra levels (20-22) use large memory windows, so run 1 large worker to avoid host OOM.
+                l_workers = 1 if cfg.zstd_level >= 20 else min(len(large_comp_jobs), 2 if total_cpus >= 4 else 1)
                 l_threads = max(1, total_cpus // l_workers)
+                if cfg.zstd_level >= 20:
+                    l_threads = min(l_threads, 4)
                 log(f"Streaming {len(large_comp_jobs)} large image(s) ({l_workers} worker x {l_threads} threads)...")
 
                 def _do_large(job):

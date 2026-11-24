@@ -2,10 +2,11 @@ import os
 import re
 import struct
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .platform_utils import get_host_zstd
+from .platform_utils import get_host_zstd, subprocess_flags
 from .sparse import parse_sparse_header_bytes
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -94,7 +95,7 @@ def is_raw_filesystem(path: str) -> bool:
 
 
 def _parse_zstd_fcs_from_bytes(buf: bytes) -> Optional[int]:
-    """Fast in-memory RFC 8878 ZSTD Frame_Content_Size parser for common single-frame headers."""
+    """Fast in-memory RFC 8878 ZSTD Frame_Content_Size parser for single-frame headers."""
     pos = 0
     n = len(buf)
     while pos + 4 <= n:
@@ -206,16 +207,31 @@ def read_zstd_frame_content_size(path: str) -> Optional[int]:
         return None
 
 
+def _count_zstd_bytes_via_cli(z_bin: str, path: str) -> Optional[int]:
+    """Stream-count decompressed bytes via zstd CLI when Frame_Content_Size is absent (zero Python deps)."""
+    try:
+        with subprocess.Popen(
+            [z_bin, "-d", "-c", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **subprocess_flags(),
+        ) as proc:
+            assert proc.stdout is not None
+            total = 0
+            buf = bytearray(4 * 1024 * 1024)
+            while True:
+                n = proc.stdout.readinto(buf)
+                if not n:
+                    break
+                total += n
+            rc = proc.wait()
+        return total if (rc == 0 and total > 0) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None, header_bytes: Optional[bytes] = None) -> int:
-    if header_bytes:
-        fast_sz = _parse_zstd_fcs_from_bytes(header_bytes)
-        if fast_sz is not None and fast_sz > 0:
-            return fast_sz
-
-    hdr_size = read_zstd_frame_content_size(path)
-    if hdr_size is not None and hdr_size > 0:
-        return hdr_size
-
+    # Prefer zstd -lv when CLI is available: accurately sums multi-frame (.zst / pzstd) archives in milliseconds.
     z_bin = zstd_bin or get_host_zstd()
     if z_bin:
         try:
@@ -223,8 +239,9 @@ def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None, header
                 [z_bin, "-lv", path],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=20,
                 check=False,
+                **subprocess_flags(),
             )
             if proc.returncode == 0:
                 m = _ZSTD_LV_BYTES_RE.search(proc.stdout)
@@ -232,9 +249,17 @@ def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None, header
                     val = int(m.group(1))
                     if val > 0:
                         return val
+                # Valid zstd stream without Frame_Content_Size: count exact bytes via CLI stream.
+                counted = _count_zstd_bytes_via_cli(z_bin, path)
+                if counted is not None and counted > 0:
+                    return counted
+            else:
+                err = (proc.stderr or "").strip()
+                raise RuntimeError(f"Corrupt or unreadable ZSTD archive {os.path.basename(path)}: {err}")
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
 
+    # Without zstd CLI: try Python zstandard (handles multi-frame + streaming) then RFC 8878 single-frame header.
     try:
         import zstandard
         dctx = zstandard.ZstdDecompressor()
@@ -248,8 +273,19 @@ def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None, header
                     total += len(chunk)
         if total > 0:
             return total
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        raise RuntimeError(f"Corrupt or unreadable ZSTD archive {os.path.basename(path)}: {exc}") from exc
+
+    if header_bytes:
+        fast_sz = _parse_zstd_fcs_from_bytes(header_bytes)
+        if fast_sz is not None and fast_sz > 0:
+            return fast_sz
+
+    hdr_size = read_zstd_frame_content_size(path)
+    if hdr_size is not None and hdr_size > 0:
+        return hdr_size
 
     raise RuntimeError(
         f"Cannot determine uncompressed size of {os.path.basename(path)} "
@@ -359,21 +395,42 @@ def scan_folder(
             break
         _parse_prop_file(ppath, props)
 
-    found: Dict[str, PartitionImage] = {}
+    resolved_zstd = zstd_bin or get_host_zstd()
+    unique_items: List[Tuple[str, str, str, int, bytes]] = []
+    seen_bases = set()
+
     for _, fpath, fname, file_size in sorted(img_candidates, key=lambda x: (x[0], x[2].lower())):
         base = strip_image_suffix(fname)
-        if not base or base in found:
+        if not base or base in seen_bases:
             continue
-
         try:
             with open(fpath, "rb") as fh:
                 head = fh.read(1088)
         except OSError:
             continue
+        seen_bases.add(base)
+        unique_items.append((base, fpath, fname, file_size, head))
 
-        if _is_zstd_magic(head):
+    zstd_items = [item for item in unique_items if _is_zstd_magic(item[4])]
+    zstd_sizes: Dict[str, int] = {}
+    if len(zstd_items) > 1:
+        workers = min(len(zstd_items), max(2, os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(get_zstd_uncompressed_size, fpath, resolved_zstd, head): base
+                for base, fpath, _fname, _fsz, head in zstd_items
+            }
+            for fut, base in futs.items():
+                zstd_sizes[base] = fut.result()
+    elif len(zstd_items) == 1:
+        base, fpath, _fname, _fsz, head = zstd_items[0]
+        zstd_sizes[base] = get_zstd_uncompressed_size(fpath, resolved_zstd, head)
+
+    found: Dict[str, PartitionImage] = {}
+    for base, fpath, fname, file_size, head in unique_items:
+        if base in zstd_sizes:
             fmt = "zstd"
-            raw_size = get_zstd_uncompressed_size(fpath, zstd_bin=zstd_bin, header_bytes=head)
+            raw_size = zstd_sizes[base]
         else:
             sp_hdr = parse_sparse_header_bytes(head)
             if sp_hdr is not None:

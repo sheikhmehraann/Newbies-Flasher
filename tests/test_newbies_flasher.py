@@ -22,6 +22,7 @@ from flasher.avb import (
 )
 from flasher.builder import (
     BuildConfig,
+    _write_all,
     build_package,
     format_output_filename,
     preview_update_binary,
@@ -136,6 +137,91 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertEqual(read_zstd_frame_content_size(zst_path), len(payload))
         with patch("flasher.partitions.get_host_zstd", return_value=None):
             self.assertEqual(get_zstd_uncompressed_size(zst_path), len(payload))
+
+    def test_zstd_multiframe_streaming_nofcs_and_corrupt_detection(self) -> None:
+        zbin = get_host_zstd()
+        self.assertIsNotNone(zbin)
+
+        # Multi-frame .zst (e.g. pzstd / concatenated frames) must sum ALL frames, not only frame 1.
+        r1 = os.path.join(self.tmp, "p1.raw")
+        r2 = os.path.join(self.tmp, "p2.raw")
+        z1 = os.path.join(self.tmp, "p1.zst")
+        z2 = os.path.join(self.tmp, "p2.zst")
+        multi = os.path.join(self.tmp, "multi.img.zst")
+        with open(r1, "wb") as f:
+            f.write(b"AAAA" * 4096)
+        with open(r2, "wb") as f:
+            f.write(b"BBBB" * 4096)
+        subprocess.run([zbin, "-1", "-f", "-q", r1, "-o", z1], check=True)
+        subprocess.run([zbin, "-1", "-f", "-q", r2, "-o", z2], check=True)
+        with open(z1, "rb") as f1, open(z2, "rb") as f2, open(multi, "wb") as fm:
+            fm.write(f1.read() + f2.read())
+        self.assertEqual(get_zstd_uncompressed_size(multi), 32768)
+
+        # Streaming .zst without Frame_Content_Size must resolve cleanly via CLI stream counting.
+        nofcs = os.path.join(self.tmp, "nofcs.img.zst")
+        proc = subprocess.run([zbin, "-1", "-c"], input=(b"STREAM" * 4096), capture_output=True, check=True)
+        with open(nofcs, "wb") as f:
+            f.write(proc.stdout)
+        self.assertIsNone(read_zstd_frame_content_size(nofcs))
+        self.assertEqual(get_zstd_uncompressed_size(nofcs), 24576)
+
+        # Corrupt .zst with valid magic must raise a clear RuntimeError.
+        bad_zst = os.path.join(self.tmp, "bad.img.zst")
+        with open(bad_zst, "wb") as f:
+            f.write(b"\x28\xb5\x2f\xfd" + b"\xff" * 64)
+        with self.assertRaises(RuntimeError):
+            get_zstd_uncompressed_size(bad_zst)
+
+    def test_zip_compresslevel_honors_levels_0_1_6_9(self) -> None:
+        import random
+        rng = random.Random(42)
+        raw_dir = os.path.join(self.tmp, "zip_lvl_imgs")
+        os.makedirs(raw_dir)
+        data = bytes((rng.randrange(256) if (i % 7 == 0) else ((i * 13) & 0x3F)) for i in range(512 * 1024))
+        with open(os.path.join(raw_dir, "boot.img"), "wb") as f:
+            f.write(data)
+
+        sizes = {}
+        for lvl in (0, 1, 6, 9):
+            out = os.path.join(self.tmp, f"zip_l{lvl}.zip")
+            res = build_package(BuildConfig(imgs_dir=raw_dir, output_zip=out, zstd_level=0, zip_level=lvl), on_log=lambda _m: None)
+            sizes[lvl] = res.size_bytes
+            with zipfile.ZipFile(res.output_zip, "r") as zf:
+                self.assertIsNone(zf.testzip())
+                self.assertEqual(zf.read("boot.img"), data)
+        self.assertGreater(sizes[0], sizes[1])
+        self.assertGreater(sizes[1], sizes[6])
+        self.assertGreater(sizes[6], sizes[9])
+
+    def test_zstd_ultra_levels_python_fallback_and_write_all(self) -> None:
+        class _ChunkedSink:
+            def __init__(self) -> None:
+                self.out = bytearray()
+
+            def write(self, data) -> int:
+                piece = bytes(data[:7])
+                self.out.extend(piece)
+                return len(piece)
+
+        sink = _ChunkedSink()
+        sample = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" * 3
+        _write_all(sink, memoryview(sample))
+        self.assertEqual(bytes(sink.out), sample)
+
+        # Ultra level 20 + 22 build cleanly with sparse + raw images
+        _make_sparse_test_image(os.path.join(self.imgs, "vendor.img"))
+        for lvl in (20, 22):
+            out = os.path.join(self.tmp, f"ultra_{lvl}.zip")
+            res = build_package(BuildConfig(imgs_dir=self.imgs, output_zip=out, zstd_level=lvl, zip_level=1), on_log=lambda _m: None)
+            with zipfile.ZipFile(res.output_zip, "r") as zf:
+                self.assertIsNone(zf.testzip())
+
+        # Missing both zstd binary and python zstandard must fail fast with actionable error
+        with patch("flasher.builder.get_host_zstd", return_value=None), patch("flasher.builder.has_python_zstandard", return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                build_package(BuildConfig(imgs_dir=self.imgs, output_zip=os.path.join(self.tmp, "noz.zip"), zstd_level=1), on_log=lambda _m: None)
+            self.assertIn("zstd is not available", str(ctx.exception))
 
     def test_avb_only_patches_top_level_vbmeta(self) -> None:
         self.assertTrue(is_top_level_vbmeta("vbmeta"))
@@ -378,7 +464,7 @@ class TestNewbiesFlasher(unittest.TestCase):
             app.zstd_slider.step(1)
             self.assertEqual(app.zstd_var.get(), 2)
             self.assertIn("Level 2", app.zstd_lbl.cget("text"))
-            self.assertIn("Scripts only", app.zip_lbl.cget("text"))
+            self.assertIn(".zst stored", app.zip_title_lbl.cget("text"))
 
             app.zstd_var.set(0)
             self.assertEqual(app.zstd_var.get(), 0)
