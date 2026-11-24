@@ -557,6 +557,14 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertEqual(app.build_btn.text, "Building...")
             app.build_btn.set_text("Build Flashable ZIP")
 
+            # Verify in-place row toggle preserves Treeview items and updates selection state
+            app._toggle_index(0)
+            self.assertFalse(app.partitions[0].selected)
+            self.assertEqual(app.tree.item("0", "values")[0], "[ ]")
+            app._toggle_index(0)
+            self.assertTrue(app.partitions[0].selected)
+            self.assertEqual(app.tree.item("0", "values")[0], "[x]")
+
             # Safe select must uncheck bootloader partitions (preloader_raw) and keep others
             app._select_safe_only()
             by_name = {p.name: p.selected for p in app.partitions}
