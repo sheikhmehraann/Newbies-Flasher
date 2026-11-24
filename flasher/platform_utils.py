@@ -63,6 +63,7 @@ def probe_executable(path: str, test_args: tuple = ("--version",)) -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def get_host_zstd() -> Optional[str]:
     host = detect_host_os()
     arch = host_arch()
@@ -83,6 +84,7 @@ def get_host_zstd() -> Optional[str]:
     return None
 
 
+@lru_cache(maxsize=1)
 def has_python_zstandard() -> bool:
     try:
         import zstandard  # noqa: F401

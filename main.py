@@ -337,9 +337,8 @@ def cli_flow() -> None:
 
     out_dir = os.path.join(ROOT_DIR, "output")
     os.makedirs(out_dir, exist_ok=True)
-    vb_only = args.vbmeta if (not any(p.selected for p in parts) and args.vbmeta in ("disable", "enable")) else ""
     out_zip = clean_path(args.output) if args.output else os.path.join(
-        out_dir, format_output_filename(device, version, codename, vbmeta_only_mode=vb_only)
+        out_dir, format_output_filename(device, version, codename)
     )
 
     cfg = BuildConfig(

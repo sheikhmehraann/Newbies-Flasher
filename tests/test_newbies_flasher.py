@@ -441,18 +441,12 @@ class TestNewbiesFlasher(unittest.TestCase):
             format_output_filename("Infinix GT 20 Pro", "1.0", ""),
             "Infinix-GT-20-Pro-1.0-Flashable.zip",
         )
-        self.assertEqual(
-            format_output_filename("Infinix GT 20 Pro", "1.0", "X6871", vbmeta_only_mode="disable"),
-            "X6871-Disable-Vbmeta-Flashable.zip",
-        )
-        self.assertEqual(
-            format_output_filename("Infinix GT 20 Pro", "1.0", "X6871", vbmeta_only_mode="enable"),
-            "X6871-Enable-Vbmeta-Flashable.zip",
-        )
+        self.assertNotIn("vbmeta", format_output_filename("Infinix GT 20 Pro", "1.0", "X6871").lower())
 
     def test_vbmeta_standalone_disable_enable_and_skip_modes(self) -> None:
         # Standalone Disable Vbmeta ZIP (no partition images required)
-        out_dis = os.path.join(self.tmp, "X6871-Disable-Vbmeta-Flashable.zip")
+        out_dis = os.path.join(self.tmp, format_output_filename("Infinix GT 20 Pro", "1.0", "X6871"))
+        self.assertNotIn("vbmeta", os.path.basename(out_dis).lower())
         res_dis = build_package(BuildConfig(imgs_dir="", output_zip=out_dis, vbmeta_mode="disable"), on_log=lambda _m: None)
         with zipfile.ZipFile(res_dis.output_zip, "r") as zf:
             self.assertIsNone(zf.testzip())
@@ -467,7 +461,8 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertNotIn("unmount_dynamic", ub)
 
         # Standalone Enable Vbmeta ZIP
-        out_en = os.path.join(self.tmp, "X6871-Enable-Vbmeta-Flashable.zip")
+        out_en = os.path.join(self.tmp, format_output_filename("Infinix GT 20 Pro", "1.1", "X6871"))
+        self.assertNotIn("vbmeta", os.path.basename(out_en).lower())
         res_en = build_package(BuildConfig(imgs_dir="", output_zip=out_en, vbmeta_mode="enable"), on_log=lambda _m: None)
         with zipfile.ZipFile(res_en.output_zip, "r") as zf:
             self.assertIsNone(zf.testzip())
@@ -513,13 +508,14 @@ class TestNewbiesFlasher(unittest.TestCase):
             app.version_var.set("15.1.2")
             self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")
 
-            # Verify AVB 2.0 Skip/Disable/Enable segmented pills and standalone preview naming
+            # Verify AVB 2.0 Skip/Disable/Enable segmented pills never inject 'vbmeta' into ZIP filename
             app.vbmeta_pills["disable"]._invoke()
             self.assertEqual(app.vbmeta_var.get(), "disable")
-            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-Disable-Vbmeta-Flashable.zip")
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")
+            self.assertNotIn("vbmeta", app.out_name_lbl.cget("text").lower())
             app.vbmeta_pills["enable"]._invoke()
             self.assertEqual(app.vbmeta_var.get(), "enable")
-            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-Enable-Vbmeta-Flashable.zip")
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")
             app.vbmeta_pills["skip"]._invoke()
             self.assertEqual(app.vbmeta_var.get(), "skip")
             self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")

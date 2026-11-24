@@ -71,12 +71,7 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 
 
-def format_output_filename(
-    device: str,
-    version: str,
-    codename: str = "",
-    vbmeta_only_mode: str = "",
-) -> str:
+def format_output_filename(device: str, version: str, codename: str = "") -> str:
     def clean(val: str) -> str:
         s = re.sub(r"[\s_]+", "-", str(val or "").strip())
         s = re.sub(r"[^a-zA-Z0-9.-]", "", s)
@@ -86,9 +81,6 @@ def format_output_filename(
     dev = clean(device) or "Device"
     ver = clean(version) or "1.0"
     primary = code or dev
-    if vbmeta_only_mode in ("disable", "enable"):
-        tag = "Disable-Vbmeta" if vbmeta_only_mode == "disable" else "Enable-Vbmeta"
-        return f"{primary}-{tag}-Flashable.zip"
     return f"{primary}-{ver}-Flashable.zip"
 
 
@@ -596,6 +588,7 @@ def build_package(
         completed_work = 0
 
         if small_comp_jobs:
+            small_comp_jobs.sort(key=lambda item: item[3], reverse=True)
             workers = min(len(small_comp_jobs), 2 if cfg.zstd_level >= 20 else total_cpus)
             log(f"Compressing {len(small_comp_jobs)} image(s) ({workers} worker x 1 thread)...")
 
@@ -620,6 +613,7 @@ def build_package(
                     progress(10.0 + (45.0 * completed_work / max(1, total_work_items)), f"Compressed {p.name} ({completed_work}/{total_work_items})")
 
         if unsparse_jobs:
+            unsparse_jobs.sort(key=lambda item: item[0].raw_size, reverse=True)
             workers = min(len(unsparse_jobs), max(1, min(4, total_cpus)))
             log(f"Unsparsing {len(unsparse_jobs)} image(s) ({workers} worker)...")
 
@@ -638,6 +632,7 @@ def build_package(
                     progress(10.0 + (45.0 * completed_work / max(1, total_work_items)), f"Unsparsed {p.name} ({completed_work}/{total_work_items})")
 
         if decompress_jobs:
+            decompress_jobs.sort(key=lambda item: item[0].raw_size, reverse=True)
             workers = min(len(decompress_jobs), total_cpus)
             log(f"Decompressing {len(decompress_jobs)} image(s)...")
 

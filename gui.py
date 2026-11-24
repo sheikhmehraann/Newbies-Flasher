@@ -618,6 +618,8 @@ class NewbiesFlasherApp:
         self.tree.column("raw", width=self._s(74), minwidth=58, anchor=tk.E, stretch=False)
         self.tree.column("disk", width=self._s(74), minwidth=58, anchor=tk.E, stretch=False)
 
+        self.tree.tag_configure("even", background=self.INPUT)
+        self.tree.tag_configure("odd", background="#12161e")
         self.tree.tag_configure("dynamic", foreground=self.DYNAMIC_FG)
         self.tree.tag_configure("super_raw", foreground=self.SUPER_FG)
         self.tree.tag_configure("bootchain", foreground=self.BOOT_FG)
@@ -697,13 +699,27 @@ class NewbiesFlasherApp:
                 self.opt_canvas.yview_moveto(0.0)
 
         def _on_opt_wheel(event) -> None:
-            if self.opt_scroll.winfo_ismapped():
-                delta = -1 if event.delta > 0 else 1
-                self.opt_canvas.yview_scroll(delta, "units")
+            if not self.opt_scroll.winfo_manager():
+                return
+            if isinstance(event.widget, FlatSlider):
+                return
+            delta = -1 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else 1
+            self.opt_canvas.yview_scroll(delta, "units")
+
+        def _bind_opt_wheel(_event=None) -> None:
+            self.root.bind_all("<MouseWheel>", _on_opt_wheel)
+            self.root.bind_all("<Button-4>", _on_opt_wheel)
+            self.root.bind_all("<Button-5>", _on_opt_wheel)
+
+        def _unbind_opt_wheel(_event=None) -> None:
+            self.root.unbind_all("<MouseWheel>")
+            self.root.unbind_all("<Button-4>")
+            self.root.unbind_all("<Button-5>")
 
         opt_body.bind("<Configure>", _sync_opt_scroll)
         self.opt_canvas.bind("<Configure>", _sync_opt_scroll)
-        self.opt_canvas.bind("<MouseWheel>", _on_opt_wheel)
+        scroll_wrap.bind("<Enter>", _bind_opt_wheel)
+        scroll_wrap.bind("<Leave>", _unbind_opt_wheel)
 
         meta_grid = tk.Frame(opt_body, bg=self.SURFACE)
         meta_grid.pack(fill=tk.X, pady=(0, 4))
@@ -748,9 +764,11 @@ class NewbiesFlasherApp:
             self.vbmeta_pills[mode] = pbtn
 
         self.vbmeta_hint_lbl = tk.Label(opt_body, text="", font=(self.ui_font, 7), fg=self.MUTED, bg=self.SURFACE, anchor=tk.W)
-        self.vbmeta_hint_lbl.pack(fill=tk.X, pady=(0, 5))
+        self.vbmeta_hint_lbl.pack(fill=tk.X, pady=(0, 4))
         self.vbmeta_var.trace_add("write", lambda *_: self._update_vbmeta_ui())
         self._update_vbmeta_ui()
+
+        tk.Frame(opt_body, height=1, bg=self.BORDER).pack(fill=tk.X, pady=(2, 5))
 
         # ZSTD Compression Slider (0..22)
         z_head = tk.Frame(opt_body, bg=self.SURFACE)
@@ -935,6 +953,7 @@ class NewbiesFlasherApp:
         self.root.bind("<Control-O>", lambda _e: self._browse_folder())
         self.root.bind("<F5>", lambda _e: self._trigger_scan_now())
         self.root.bind("<Control-b>", lambda _e: self._start_build() if not self.is_building else None)
+        self.root.bind("<Escape>", lambda _e: self._cancel_build() if self.is_building else None)
 
     def _grid_entry(self, parent, row: int, col: int, label: str, var: tk.StringVar, pad_right: int) -> None:
         tk.Label(parent, text=label, font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).grid(
@@ -1011,10 +1030,7 @@ class NewbiesFlasherApp:
         dev = self.device_var.get().strip() or DEFAULT_DEVICE
         code = self.codename_var.get().strip()
         ver = self.version_var.get().strip() or DEFAULT_VERSION
-        mode = self.vbmeta_var.get() if hasattr(self, "vbmeta_var") else "skip"
-        has_sel = any(p.selected for p in self.partitions)
-        vb_only = mode if (not has_sel and mode in ("disable", "enable")) else ""
-        fname = format_output_filename(dev, ver, code, vbmeta_only_mode=vb_only)
+        fname = format_output_filename(dev, ver, code)
         self.out_name_lbl.config(text=fname)
         short_dir = self.output_dir
         if len(short_dir) > 46:
@@ -1079,7 +1095,17 @@ class NewbiesFlasherApp:
             "disk": lambda p: p.file_size,
         }
         self.partitions.sort(key=key_map[col], reverse=self.sort_desc)
+        self._update_sort_headings()
         self._refresh_tree()
+
+    def _update_sort_headings(self) -> None:
+        base_titles = {"name": "Partition", "kind": "Type", "fmt": "Fmt", "raw": "Raw", "disk": "File"}
+        for key, label in base_titles.items():
+            if key == self.sort_col:
+                suffix = " v" if self.sort_desc else " ^"
+                self.tree.heading(key, text=label + suffix)
+            else:
+                self.tree.heading(key, text=label)
 
     def _refresh_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -1090,11 +1116,13 @@ class NewbiesFlasherApp:
             if p.selected:
                 sel_count += 1
                 sel_raw += p.raw_size
-            tags = ()
+            stripe = "odd" if (idx % 2) else "even"
             if not p.selected:
-                tags = ("unchecked",)
+                tags = (stripe, "unchecked")
             elif p.kind in ("dynamic", "super_raw", "bootchain", "bootloader"):
-                tags = (p.kind,)
+                tags = (stripe, p.kind)
+            else:
+                tags = (stripe,)
             self.tree.insert(
                 "",
                 tk.END,
@@ -1105,8 +1133,6 @@ class NewbiesFlasherApp:
         self.sel_summary_lbl.config(
             text=f"Selected: {sel_count}/{len(self.partitions)} | Raw: {_fmt_size(sel_raw)}"
         )
-        if hasattr(self, "out_name_lbl"):
-            self._update_output_preview()
 
     def _toggle_index(self, idx: int) -> None:
         if 0 <= idx < len(self.partitions):
@@ -1144,9 +1170,7 @@ class NewbiesFlasherApp:
 
         os.makedirs(self.output_dir, exist_ok=True)
         mode = self.vbmeta_var.get()
-        has_sel = any(p.selected for p in self.partitions)
-        vb_only = mode if (not has_sel and mode in ("disable", "enable")) else ""
-        out_zip = os.path.join(self.output_dir, format_output_filename(dev, ver, code, vbmeta_only_mode=vb_only))
+        out_zip = os.path.join(self.output_dir, format_output_filename(dev, ver, code))
 
         return BuildConfig(
             imgs_dir=imgs_dir,
@@ -1344,9 +1368,13 @@ class NewbiesFlasherApp:
                     continue
                 self.partitions = parts
                 self.sort_col = ""
+                self._update_sort_headings()
                 self._refresh_tree()
                 if parts:
-                    self.scan_lbl.config(text=f"Found {len(parts)} image(s)", fg=self.OK)
+                    dyn_n = sum(1 for p in parts if p.kind in ("dynamic", "super_raw"))
+                    boot_n = sum(1 for p in parts if p.kind == "bootchain")
+                    fw_n = len(parts) - dyn_n - boot_n
+                    self.scan_lbl.config(text=f"{len(parts)} images ({dyn_n} dyn, {boot_n} boot, {fw_n} fw)", fg=self.OK)
                 else:
                     self.scan_lbl.config(text="No .img or .img.zst files found", fg=self.WARN)
                 if props["device"] and self.device_var.get() in ("", DEFAULT_DEVICE):
