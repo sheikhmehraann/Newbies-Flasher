@@ -15,7 +15,7 @@ from flasher.builder import (
     format_output_filename,
     preview_update_binary,
 )
-from flasher.partitions import detect_build_props, scan_partitions
+from flasher.partitions import scan_folder
 from flasher.platform_utils import detect_host_os, get_host_zstd, has_python_zstandard
 
 DEFAULT_DEVICE = "Infinix GT 20 Pro"
@@ -105,7 +105,7 @@ def interactive_flow() -> None:
                 if not path_cand or not os.path.isdir(path_cand):
                     print(f"Folder not found: {path_cand or raw}\n")
                     continue
-                parts = scan_partitions(path_cand)
+                parts, props = scan_folder(path_cand)
                 if not parts:
                     print(f"No .img or .img.zst files found in: {path_cand}\n")
                     continue
@@ -114,7 +114,6 @@ def interactive_flow() -> None:
                 state["partitions"] = parts
                 print(f"Found {len(parts)} partition image(s).")
 
-                props = detect_build_props(path_cand)
                 if props["device"] and state["device"] in ("", DEFAULT_DEVICE):
                     state["device"] = props["device"]
                 if props["codename"] and state["codename"] in ("", DEFAULT_CODENAME):
@@ -317,12 +316,11 @@ def cli_flow() -> None:
     if not imgs_path or not os.path.isdir(imgs_path):
         parser.error(f"Images directory not found: {args.imgs_path}")
 
-    parts = scan_partitions(imgs_path)
+    parts, props = scan_folder(imgs_path)
     if not parts:
         print(f"Error: no .img or .img.zst files found in {imgs_path}")
         sys.exit(1)
 
-    props = detect_build_props(imgs_path)
     device = args.device if args.device is not None else (props["device"] or DEFAULT_DEVICE)
     codename = args.codename if args.codename is not None else (props["codename"] or DEFAULT_CODENAME)
     version = args.version if args.version is not None else (props["version"] or DEFAULT_VERSION)

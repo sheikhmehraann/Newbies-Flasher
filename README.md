@@ -19,7 +19,7 @@ Requires Python 3.8 or newer. No external Python packages are needed.
   - Orders ZIP entries so `META-INF/` and small boot/firmware images stay below the 4 GiB ZIP64 boundary before large dynamic images.
   - Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
   - Reports byte-weighted recovery progress and total flash time.
-- Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Safe (skip bootloader)` in GUI).
+- Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Skip Bootloader` in GUI).
 - Supports safe AVB 2.0 flag patching on top-level `vbmeta` only (leaves chained `vbmeta_system` and `vbmeta_vendor` flags at 0 so `libavb` does not reject them).
 - Probes bundled binaries before using them and falls back to system `zstd` or Python `zstandard` automatically on any CPU or OS.
 
@@ -67,7 +67,7 @@ chmod +x run_termux.sh
 ## GUI Usage
 
 1. Click **Browse...** (`Ctrl+O`) and pick the folder containing your `.img` or `.img.zst` files.
-2. Review the color-coded partition list (click any column header to sort). Click any row (or press Space) to include or exclude specific partitions, or click **Safe (skip bootloader)**.
+2. Review the color-coded partition list (click any column header to sort). Click any row (or press Space) to include or exclude specific partitions, or click **Skip Bootloader**.
 3. Check Device Name, Codename, Version, and Maintainer (defaults to `Infinix GT 20 Pro` / `X6871` as an example, and auto-fills if a `build.prop` is present).
 4. Pick AVB mode (`skip`, `disable`, `enable`) and adjust the ZSTD / ZIP sliders (drag, click anywhere on the bar, scroll, or use `-` / `+`).
    - ZSTD Level `1` gives the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.

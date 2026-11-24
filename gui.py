@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Callable, List, Optional
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if ROOT_DIR not in sys.path:
@@ -23,7 +23,7 @@ from flasher.builder import (
     format_output_filename,
     preview_update_binary,
 )
-from flasher.partitions import PartitionImage, detect_build_props, scan_partitions
+from flasher.partitions import PartitionImage, scan_folder
 from flasher.platform_utils import (
     detect_host_os,
     get_host_zstd,
@@ -71,6 +71,186 @@ def _fmt_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+def _rounded_rect_points(x1: float, y1: float, x2: float, y2: float, r: float) -> List[float]:
+    r = max(0.0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    return [
+        x1 + r, y1,
+        x2 - r, y1,
+        x2, y1,
+        x2, y1 + r,
+        x2, y2 - r,
+        x2, y2,
+        x2 - r, y2,
+        x1 + r, y2,
+        x1, y2,
+        x1, y2 - r,
+        x1, y1 + r,
+        x1, y1,
+    ]
+
+
+class PillButton(tk.Canvas):
+    """Cross-platform rounded clickable pill button with exact DPI-safe sizing."""
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        text: str,
+        command: Optional[Callable[[], None]],
+        font_spec: tuple,
+        bg: str,
+        hover_bg: str,
+        fg: str,
+        parent_bg: str,
+        border: str = "",
+        disabled_bg: str = "#1c2029",
+        disabled_fg: str = "#636b7a",
+        pad_x: int = 12,
+        pad_y: int = 5,
+        min_w: int = 0,
+        min_h: int = 0,
+        pill: bool = False,
+        clickable: bool = True,
+    ):
+        self._font = tkfont.Font(family=font_spec[0], size=font_spec[1], weight=font_spec[2] if len(font_spec) > 2 else "normal")
+        self._text = text
+        self._command = command
+        self._bg = bg
+        self._hover_bg = hover_bg
+        self._fg = fg
+        self._border = border
+        self._disabled_bg = disabled_bg
+        self._disabled_fg = disabled_fg
+        self._pad_x = pad_x
+        self._pad_y = pad_y
+        self._min_w = min_w
+        self._min_h = min_h
+        self._pill = pill
+        self._clickable = clickable
+        self._enabled = True
+        self._hovered = False
+        self._pressed = False
+        self._shape_id: Optional[int] = None
+        self._text_id: Optional[int] = None
+
+        w, h = self._measure()
+        super().__init__(
+            parent,
+            width=w,
+            height=h,
+            bg=parent_bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2" if clickable else "",
+            takefocus=1 if clickable else 0,
+        )
+
+        self.bind("<Configure>", lambda _e: self._redraw())
+        if clickable:
+            self.bind("<Enter>", self._on_enter)
+            self.bind("<Leave>", self._on_leave)
+            self.bind("<ButtonPress-1>", self._on_press)
+            self.bind("<ButtonRelease-1>", self._on_release)
+            self.bind("<Return>", lambda _e: self._invoke())
+            self.bind("<space>", lambda _e: self._invoke())
+        self._redraw()
+
+    def _measure(self) -> tuple:
+        tw = self._font.measure(self._text)
+        th = self._font.metrics("linespace")
+        w = max(self._min_w, tw + 2 * self._pad_x)
+        h = max(self._min_h, th + 2 * self._pad_y)
+        return int(w), int(h)
+
+    def _current_colors(self) -> tuple:
+        if not self._enabled:
+            return self._disabled_bg, self._disabled_fg
+        if self._pressed or self._hovered:
+            return self._hover_bg, self._fg
+        return self._bg, self._fg
+
+    def _redraw(self) -> None:
+        if not self.winfo_exists():
+            return
+        w = max(self.winfo_width(), int(self.cget("width")))
+        h = max(self.winfo_height(), int(self.cget("height")))
+        fill, fg = self._current_colors()
+        radius = (h / 2.0) if self._pill else min(h / 2.0, 7.0)
+        pts = _rounded_rect_points(1, 1, w - 1, h - 1, radius)
+        outline = self._border if self._border else fill
+
+        if self._shape_id is None:
+            self._shape_id = self.create_polygon(pts, smooth=True, splinesteps=12, fill=fill, outline=outline, width=1)
+            self._text_id = self.create_text(w / 2.0, h / 2.0, text=self._text, fill=fg, font=self._font)
+        else:
+            self.coords(self._shape_id, *pts)
+            self.itemconfig(self._shape_id, fill=fill, outline=outline)
+            self.coords(self._text_id, w / 2.0, h / 2.0)
+            self.itemconfig(self._text_id, text=self._text, fill=fg)
+
+    def _refresh_colors(self) -> None:
+        if self._shape_id is None or not self.winfo_exists():
+            return
+        fill, fg = self._current_colors()
+        outline = self._border if self._border else fill
+        self.itemconfig(self._shape_id, fill=fill, outline=outline)
+        self.itemconfig(self._text_id, fill=fg)
+
+    def _on_enter(self, _event) -> None:
+        if self._enabled:
+            self._hovered = True
+            self._refresh_colors()
+
+    def _on_leave(self, _event) -> None:
+        self._hovered = False
+        self._pressed = False
+        self._refresh_colors()
+
+    def _on_press(self, _event) -> None:
+        if self._enabled:
+            self._pressed = True
+            self._refresh_colors()
+
+    def _on_release(self, event) -> None:
+        was_pressed = self._pressed
+        self._pressed = False
+        self._refresh_colors()
+        if was_pressed and self._enabled:
+            if 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height():
+                self._invoke()
+
+    def _invoke(self) -> None:
+        if self._enabled and self._command is not None:
+            self._command()
+
+    def set_text(self, text: str) -> None:
+        if self._text == text:
+            return
+        self._text = text
+        w, h = self._measure()
+        super().configure(width=w, height=h)
+        self._redraw()
+
+    def set_command(self, cmd: Optional[Callable[[], None]]) -> None:
+        self._command = cmd
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+        if not self._enabled:
+            self._hovered = False
+            self._pressed = False
+        super().configure(cursor="hand2" if (self._clickable and self._enabled) else "")
+        self._refresh_colors()
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+
 class FlatSlider(tk.Canvas):
     """Dark-theme integer slider with click-to-jump, smooth drag, and mouse-wheel stepping."""
 
@@ -84,9 +264,10 @@ class FlatSlider(tk.Canvas):
         track_color: str,
         fill_color: str,
         thumb_color: str,
+        height: int = 24,
         on_change: Optional[Callable[[int], None]] = None,
     ):
-        super().__init__(parent, height=22, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        super().__init__(parent, height=height, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
         self.var = variable
         self.lo = from_
         self.hi = to
@@ -96,6 +277,9 @@ class FlatSlider(tk.Canvas):
         self.on_change = on_change
         self._hover = False
         self._pad = 9
+        self._track_id: Optional[int] = None
+        self._fill_id: Optional[int] = None
+        self._thumb_id: Optional[int] = None
 
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<Button-1>", self._on_pointer)
@@ -173,21 +357,26 @@ class FlatSlider(tk.Canvas):
         x1 = w - self._pad
         tx = x0 + ratio * (x1 - x0)
         cy = h // 2
-
-        self.delete("all")
-        self.create_line(x0, cy, x1, cy, fill=self.track_color, width=5, capstyle=tk.ROUND)
-        if tx > x0:
-            self.create_line(x0, cy, tx, cy, fill=self.fill_color, width=5, capstyle=tk.ROUND)
         r = 7 if self._hover else 6
         ring = self.fill_color if self._hover else "#101216"
-        self.create_oval(tx - r, cy - r, tx + r, cy + r, fill=self.thumb_color, outline=ring, width=2)
+
+        if self._track_id is None:
+            self._track_id = self.create_line(x0, cy, x1, cy, fill=self.track_color, width=5, capstyle=tk.ROUND)
+            self._fill_id = self.create_line(x0, cy, max(x0, tx), cy, fill=self.fill_color, width=5, capstyle=tk.ROUND)
+            self._thumb_id = self.create_oval(tx - r, cy - r, tx + r, cy + r, fill=self.thumb_color, outline=ring, width=2)
+        else:
+            self.coords(self._track_id, x0, cy, x1, cy)
+            self.coords(self._fill_id, x0, cy, max(x0, tx), cy)
+            self.itemconfig(self._fill_id, fill=self.fill_color, state=tk.NORMAL if tx > x0 else tk.HIDDEN)
+            self.coords(self._thumb_id, tx - r, cy - r, tx + r, cy + r)
+            self.itemconfig(self._thumb_id, outline=ring)
 
 
 class NewbiesFlasherApp:
     BG = "#111318"
     SURFACE = "#181c23"
     SURFACE_ALT = "#222733"
-    SURFACE_HOVER = "#2c3342"
+    SURFACE_HOVER = "#2e3545"
     BORDER = "#2a303d"
     INPUT = "#0e1015"
     TEXT = "#edf1f7"
@@ -207,15 +396,17 @@ class NewbiesFlasherApp:
         self.root = root
         self.root.title(f"Newbies Flasher v{__version__}")
 
-        # Fit cleanly inside any display, including 1360x768 and 1280x720 laptops.
+        # Scale initial window cleanly with both display resolution and OS DPI scaling.
+        dpi = max(1.0, min(2.25, self.root.winfo_fpixels("1i") / 96.0))
+        self.dpi = dpi
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        win_w = min(1120, max(860, sw - 80))
-        win_h = min(650, max(540, sh - 100))
+        win_w = min(int(1100 * dpi), max(840, sw - 60))
+        win_h = min(int(650 * dpi), max(520, sh - 84))
         pos_x = max(0, (sw - win_w) // 2)
-        pos_y = max(0, (sh - win_h) // 2 - 16)
+        pos_y = max(0, (sh - win_h) // 2 - 14)
         self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        self.root.minsize(840, 520)
+        self.root.minsize(min(840, max(640, sw - 80)), min(520, max(460, sh - 90)))
         self.root.configure(bg=self.BG)
         _apply_windows_dark_chrome(self.root)
 
@@ -246,6 +437,9 @@ class NewbiesFlasherApp:
         self.root.bind("<Destroy>", self._on_destroy)
         self._poll_queue()
 
+    def _s(self, px: int) -> int:
+        return max(1, int(round(px * self.dpi)))
+
     def _setup_styles(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
@@ -256,7 +450,7 @@ class NewbiesFlasherApp:
             foreground=self.TEXT,
             fieldbackground=self.INPUT,
             bordercolor=self.BORDER,
-            rowheight=24,
+            rowheight=max(22, self._s(24)),
             font=(self.ui_font, 9),
         )
         style.configure(
@@ -285,7 +479,7 @@ class NewbiesFlasherApp:
             bordercolor=self.BORDER,
             lightcolor=self.ACCENT,
             darkcolor=self.ACCENT,
-            thickness=7,
+            thickness=max(6, self._s(7)),
         )
         style.configure(
             "NF.TCombobox",
@@ -305,54 +499,96 @@ class NewbiesFlasherApp:
 
     def _build_layout(self) -> None:
         outer = tk.Frame(self.root, bg=self.BG)
-        outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        outer.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        # Top Bar
+        # Row 0: Top Bar (action pills packed RIGHT first so buttons never squish on narrow screens)
         top = tk.Frame(outer, bg=self.BG)
-        top.pack(fill=tk.X, pady=(0, 8))
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-        tk.Label(
-            top, text="Newbies Flasher", font=(self.ui_font, 15, "bold"),
+        open_out_pill = self._pill(top, "Open Output", self._open_output, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.BG, pad=(11, 5), size=8, bold=True, pill=True, border=self.BORDER)
+        open_out_pill.pack(side=tk.RIGHT)
+        preview_pill = self._pill(top, "Preview Script", self._open_script_preview, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.BG, pad=(11, 5), size=8, bold=True, pill=True, border=self.BORDER)
+        preview_pill.pack(side=tk.RIGHT, padx=(0, 6))
+
+        title_lbl = tk.Label(
+            top, text="Newbies Flasher", font=(self.ui_font, 14, "bold"),
             fg=self.TEXT, bg=self.BG,
-        ).pack(side=tk.LEFT)
+        )
+        title_lbl.pack(side=tk.LEFT)
 
-        tk.Label(
-            top, text=f"v{__version__}", font=(self.ui_font, 9),
+        ver_lbl = tk.Label(
+            top, text=f"v{__version__}", font=(self.ui_font, 8),
             fg=self.MUTED, bg=self.BG,
-        ).pack(side=tk.LEFT, padx=(6, 12), pady=(4, 0))
+        )
+        ver_lbl.pack(side=tk.LEFT, padx=(6, 10), pady=(3, 0))
 
         zstd_status = "zstd: ready" if get_host_zstd() else ("zstd: python" if has_python_zstandard() else "zstd: missing")
-        tk.Label(
+        status_pill = self._pill(
             top,
-            text=f"{detect_host_os()} | {zstd_status}",
-            font=(self.ui_font, 8, "bold"),
-            fg=self.OK if "missing" not in zstd_status else self.WARN,
+            f"{detect_host_os()} | {zstd_status}",
+            None,
             bg=self.SURFACE,
-            padx=8,
-            pady=3,
-            highlightthickness=1,
-            highlightbackground=self.BORDER,
-        ).pack(side=tk.LEFT, pady=(2, 0))
+            hover=self.SURFACE,
+            fg=self.OK if "missing" not in zstd_status else self.WARN,
+            parent_bg=self.BG,
+            pad=(9, 3),
+            size=8,
+            bold=True,
+            pill=True,
+            border=self.BORDER,
+            clickable=False,
+        )
+        status_pill.pack(side=tk.LEFT, pady=(1, 0))
 
-        self._btn(top, "Open Output", self._open_output, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(10, 4), size=9).pack(side=tk.RIGHT)
-        self._btn(top, "Preview Script", self._open_script_preview, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(10, 4), size=9).pack(side=tk.RIGHT, padx=(0, 6))
+        def _sync_top_bar(_event=None) -> None:
+            if not top.winfo_exists():
+                return
+            avail = top.winfo_width()
+            if avail < 100:
+                return
+            needed = (
+                title_lbl.winfo_reqwidth()
+                + ver_lbl.winfo_reqwidth()
+                + status_pill.winfo_reqwidth()
+                + preview_pill.winfo_reqwidth()
+                + open_out_pill.winfo_reqwidth()
+                + 64
+            )
+            if avail < needed:
+                if status_pill.winfo_manager():
+                    status_pill.pack_forget()
+            else:
+                if not status_pill.winfo_manager():
+                    status_pill.pack(side=tk.LEFT, pady=(1, 0))
 
-        # Main Two-Pane Workspace
+        top.bind("<Configure>", _sync_top_bar)
+        self.root.after_idle(_sync_top_bar)
+
+        # Row 1: Main Two-Pane Workspace (proportional columns keep both panes unclipped at any width/DPI)
         main_pane = tk.Frame(outer, bg=self.BG)
-        main_pane.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        main_pane.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        main_pane.rowconfigure(0, weight=1)
+        main_pane.columnconfigure(0, weight=5, minsize=280)
+        main_pane.columnconfigure(1, weight=3, minsize=280)
 
-        # Left Pane: Folder picker + Sortable partition checklist
+        # Left Pane: Partition Images
         left_card = tk.Frame(main_pane, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=10, pady=8)
-        left_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left_card.columnconfigure(0, weight=1)
+        left_card.rowconfigure(2, weight=1)
 
         left_head = tk.Frame(left_card, bg=self.SURFACE)
-        left_head.pack(fill=tk.X)
+        left_head.grid(row=0, column=0, sticky="ew")
         tk.Label(left_head, text="Partition Images", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(side=tk.LEFT)
         self.scan_lbl = tk.Label(left_head, text="Select a folder with .img / .img.zst files", font=(self.ui_font, 8), fg=self.MUTED, bg=self.SURFACE)
         self.scan_lbl.pack(side=tk.RIGHT)
 
         path_row = tk.Frame(left_card, bg=self.SURFACE)
-        path_row.pack(fill=tk.X, pady=(6, 6))
+        path_row.grid(row=1, column=0, sticky="ew", pady=(6, 6))
+        self._pill(path_row, "Rescan", self._trigger_scan_now, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(9, 4), size=8, bold=True, border=self.BORDER).pack(side=tk.RIGHT)
+        self._pill(path_row, "Browse...", self._browse_folder, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(10, 4), size=8, bold=True, border=self.BORDER).pack(side=tk.RIGHT, padx=(0, 5))
 
         self.path_var = tk.StringVar()
         self.path_entry = tk.Entry(
@@ -370,14 +606,11 @@ class NewbiesFlasherApp:
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 6))
         self.path_entry.bind("<KeyRelease>", self._schedule_scan)
 
-        self._btn(path_row, "Browse...", self._browse_folder, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(10, 3), size=9).pack(side=tk.LEFT, padx=(0, 4))
-        self._btn(path_row, "Rescan", self._trigger_scan_now, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(8, 3), size=9).pack(side=tk.LEFT)
-
         tree_wrap = tk.Frame(left_card, bg=self.SURFACE)
-        tree_wrap.pack(fill=tk.BOTH, expand=True)
+        tree_wrap.grid(row=2, column=0, sticky="nsew")
 
         cols = ("use", "name", "kind", "fmt", "raw", "disk")
-        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=9, style="NF.Treeview", selectmode="browse")
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=7, style="NF.Treeview", selectmode="browse")
         self.tree.heading("use", text="Use")
         self.tree.heading("name", text="Partition", command=lambda: self._sort_partitions("name"))
         self.tree.heading("kind", text="Type", command=lambda: self._sort_partitions("kind"))
@@ -385,12 +618,12 @@ class NewbiesFlasherApp:
         self.tree.heading("raw", text="Raw", command=lambda: self._sort_partitions("raw"))
         self.tree.heading("disk", text="File", command=lambda: self._sort_partitions("disk"))
 
-        self.tree.column("use", width=44, anchor=tk.CENTER, stretch=False)
-        self.tree.column("name", width=165, anchor=tk.W)
-        self.tree.column("kind", width=82, anchor=tk.CENTER, stretch=False)
-        self.tree.column("fmt", width=58, anchor=tk.CENTER, stretch=False)
-        self.tree.column("raw", width=80, anchor=tk.E, stretch=False)
-        self.tree.column("disk", width=80, anchor=tk.E, stretch=False)
+        self.tree.column("use", width=self._s(42), minwidth=36, anchor=tk.CENTER, stretch=False)
+        self.tree.column("name", width=self._s(150), minwidth=90, anchor=tk.W, stretch=True)
+        self.tree.column("kind", width=self._s(78), minwidth=62, anchor=tk.CENTER, stretch=False)
+        self.tree.column("fmt", width=self._s(52), minwidth=42, anchor=tk.CENTER, stretch=False)
+        self.tree.column("raw", width=self._s(74), minwidth=58, anchor=tk.E, stretch=False)
+        self.tree.column("disk", width=self._s(74), minwidth=58, anchor=tk.E, stretch=False)
 
         self.tree.tag_configure("dynamic", foreground=self.DYNAMIC_FG)
         self.tree.tag_configure("super_raw", foreground=self.SUPER_FG)
@@ -407,23 +640,80 @@ class NewbiesFlasherApp:
         self.tree.bind("<space>", self._on_tree_space)
 
         sel_bar = tk.Frame(left_card, bg=self.SURFACE)
-        sel_bar.pack(fill=tk.X, pady=(6, 0))
-
-        self._btn(sel_bar, "All", lambda: self._set_all_selected(True), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 4))
-        self._btn(sel_bar, "None", lambda: self._set_all_selected(False), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 4))
-        self._btn(sel_bar, "Safe (skip bootloader)", self._select_safe_only, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(8, 2), size=8).pack(side=tk.LEFT)
+        sel_bar.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        all_pill = self._pill(sel_bar, "All", lambda: self._set_all_selected(True), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(10, 3), size=8, bold=True, pill=True, border=self.BORDER)
+        all_pill.pack(side=tk.LEFT, padx=(0, 4))
+        none_pill = self._pill(sel_bar, "None", lambda: self._set_all_selected(False), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(10, 3), size=8, bold=True, pill=True, border=self.BORDER)
+        none_pill.pack(side=tk.LEFT, padx=(0, 4))
+        safe_pill = self._pill(sel_bar, "Skip Bootloader", self._select_safe_only, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(10, 3), size=8, bold=True, pill=True, border=self.BORDER)
+        safe_pill.pack(side=tk.LEFT)
         self.sel_summary_lbl = tk.Label(sel_bar, text="Selected: 0/0", font=(self.ui_font, 8), fg=self.MUTED, bg=self.SURFACE)
         self.sel_summary_lbl.pack(side=tk.RIGHT)
 
-        # Right Pane: ROM metadata, compression sliders, output path, and Build CTA
-        right_card = tk.Frame(main_pane, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=12, pady=8, width=376)
-        right_card.pack(side=tk.RIGHT, fill=tk.Y)
-        right_card.pack_propagate(False)
+        def _sync_sel_bar(_event=None) -> None:
+            if not sel_bar.winfo_exists():
+                return
+            avail = sel_bar.winfo_width()
+            if avail < 100:
+                return
+            needed = all_pill.winfo_reqwidth() + none_pill.winfo_reqwidth() + safe_pill.winfo_reqwidth() + self.sel_summary_lbl.winfo_reqwidth() + 20
+            if avail < needed:
+                if self.sel_summary_lbl.winfo_manager():
+                    self.sel_summary_lbl.pack_forget()
+            else:
+                if not self.sel_summary_lbl.winfo_manager():
+                    self.sel_summary_lbl.pack(side=tk.RIGHT)
 
-        tk.Label(right_card, text="ROM Info & Options", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(anchor=tk.W, pady=(0, 6))
+        sel_bar.bind("<Configure>", _sync_sel_bar)
 
-        meta_grid = tk.Frame(right_card, bg=self.SURFACE)
-        meta_grid.pack(fill=tk.X, pady=(0, 6))
+        # Right Pane: Auto-scrolling Options Viewport + Pinned Build CTA (never squishes buttons at any DPI/size)
+        right_card = tk.Frame(main_pane, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=10, pady=8)
+        right_card.grid(row=0, column=1, sticky="nsew")
+        right_card.columnconfigure(0, weight=1)
+        right_card.rowconfigure(1, weight=1)
+
+        tk.Label(right_card, text="ROM Info & Options", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        scroll_wrap = tk.Frame(right_card, bg=self.SURFACE)
+        scroll_wrap.grid(row=1, column=0, sticky="nsew")
+        scroll_wrap.columnconfigure(0, weight=1)
+        scroll_wrap.rowconfigure(0, weight=1)
+
+        self.opt_canvas = tk.Canvas(scroll_wrap, bg=self.SURFACE, width=320, highlightthickness=0, bd=0)
+        self.opt_scroll = ttk.Scrollbar(scroll_wrap, orient=tk.VERTICAL, command=self.opt_canvas.yview)
+        self.opt_canvas.configure(yscrollcommand=self.opt_scroll.set)
+        self.opt_canvas.grid(row=0, column=0, sticky="nsew")
+
+        opt_body = tk.Frame(self.opt_canvas, bg=self.SURFACE)
+        self._opt_win_id = self.opt_canvas.create_window((0, 0), window=opt_body, anchor="nw")
+
+        def _sync_opt_scroll(_event=None) -> None:
+            if not self.opt_canvas.winfo_exists():
+                return
+            cw = max(240, self.opt_canvas.winfo_width())
+            self.opt_canvas.itemconfigure(self._opt_win_id, width=cw)
+            req_h = opt_body.winfo_reqheight()
+            view_h = self.opt_canvas.winfo_height()
+            self.opt_canvas.configure(scrollregion=(0, 0, cw, max(req_h, view_h)))
+            if req_h > view_h + 2 and view_h > 20:
+                if not self.opt_scroll.winfo_manager():
+                    self.opt_scroll.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+            else:
+                if self.opt_scroll.winfo_manager():
+                    self.opt_scroll.grid_remove()
+                self.opt_canvas.yview_moveto(0.0)
+
+        def _on_opt_wheel(event) -> None:
+            if self.opt_scroll.winfo_ismapped():
+                delta = -1 if event.delta > 0 else 1
+                self.opt_canvas.yview_scroll(delta, "units")
+
+        opt_body.bind("<Configure>", _sync_opt_scroll)
+        self.opt_canvas.bind("<Configure>", _sync_opt_scroll)
+        self.opt_canvas.bind("<MouseWheel>", _on_opt_wheel)
+
+        meta_grid = tk.Frame(opt_body, bg=self.SURFACE)
+        meta_grid.pack(fill=tk.X, pady=(0, 4))
         meta_grid.columnconfigure(0, weight=1)
         meta_grid.columnconfigure(1, weight=1)
 
@@ -440,45 +730,45 @@ class NewbiesFlasherApp:
         self._grid_entry(meta_grid, 2, 0, "Version", self.version_var, pad_right=6)
         self._grid_entry(meta_grid, 2, 1, "Maintainer", self.maintainer_var, pad_right=0)
 
-        tk.Label(right_card, text="AVB 2.0 (top-level vbmeta)", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(anchor=tk.W, pady=(2, 1))
+        tk.Label(opt_body, text="AVB 2.0 (top-level vbmeta)", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(anchor=tk.W, pady=(2, 1))
         self.vbmeta_var = tk.StringVar(value="skip")
         ttk.Combobox(
-            right_card,
+            opt_body,
             textvariable=self.vbmeta_var,
             values=("skip", "disable", "enable"),
             state="readonly",
             style="NF.TCombobox",
-        ).pack(fill=tk.X, pady=(0, 8))
+        ).pack(fill=tk.X, pady=(0, 6))
 
         # ZSTD Compression Slider (0..22)
-        z_head = tk.Frame(right_card, bg=self.SURFACE)
+        z_head = tk.Frame(opt_body, bg=self.SURFACE)
         z_head.pack(fill=tk.X)
         tk.Label(z_head, text="ZSTD Compression", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
         self.zstd_lbl = tk.Label(z_head, text="", font=(self.ui_font, 8, "bold"), fg=self.ACCENT_HOVER, bg=self.SURFACE)
         self.zstd_lbl.pack(side=tk.RIGHT)
 
         self.zstd_var = tk.IntVar(value=1)
-        self.zstd_slider = self._make_slider_row(right_card, self.zstd_var, 0, 22, self._update_zstd_ui)
+        self.zstd_slider = self._make_slider_row(opt_body, self.zstd_var, 0, 22, self._update_zstd_ui)
 
         # ZIP Compression Slider (0..9)
-        p_head = tk.Frame(right_card, bg=self.SURFACE)
-        p_head.pack(fill=tk.X, pady=(4, 0))
+        p_head = tk.Frame(opt_body, bg=self.SURFACE)
+        p_head.pack(fill=tk.X, pady=(2, 0))
         self.zip_title_lbl = tk.Label(p_head, text="ZIP Level", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE)
         self.zip_title_lbl.pack(side=tk.LEFT)
         self.zip_lbl = tk.Label(p_head, text="", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE)
         self.zip_lbl.pack(side=tk.RIGHT)
 
         self.zip_var = tk.IntVar(value=1)
-        self.zip_slider = self._make_slider_row(right_card, self.zip_var, 0, 9, self._update_zip_ui)
+        self.zip_slider = self._make_slider_row(opt_body, self.zip_var, 0, 9, self._update_zip_ui)
 
         # Output ZIP Preview + Folder Picker
-        out_head = tk.Frame(right_card, bg=self.SURFACE)
-        out_head.pack(fill=tk.X, pady=(8, 0))
+        out_head = tk.Frame(opt_body, bg=self.SURFACE)
+        out_head.pack(fill=tk.X, pady=(6, 0))
+        self._pill(out_head, "Change Folder...", self._browse_output_dir, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(8, 2), size=8, bold=True, pill=True, border=self.BORDER).pack(side=tk.RIGHT)
         tk.Label(out_head, text="Output ZIP", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
-        self._btn(out_head, "Change Folder...", self._browse_output_dir, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(6, 1), size=8).pack(side=tk.RIGHT)
 
         self.out_name_lbl = tk.Label(
-            right_card,
+            opt_body,
             text="",
             font=(self.mono_font, 8),
             fg=self.TEXT,
@@ -491,47 +781,56 @@ class NewbiesFlasherApp:
         )
         self.out_name_lbl.pack(fill=tk.X, pady=(3, 2))
 
-        self.out_dir_lbl = tk.Label(right_card, text="", font=(self.ui_font, 7), fg=self.MUTED, bg=self.SURFACE, anchor=tk.W)
+        self.out_dir_lbl = tk.Label(opt_body, text="", font=(self.ui_font, 7), fg=self.MUTED, bg=self.SURFACE, anchor=tk.W)
         self.out_dir_lbl.pack(fill=tk.X)
 
+        # Pinned CTA Footer (always full height, never squished)
         cta_row = tk.Frame(right_card, bg=self.SURFACE)
-        cta_row.pack(fill=tk.X, side=tk.BOTTOM, pady=(10, 0))
+        cta_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        cta_row.columnconfigure(0, weight=1)
 
-        self.build_btn = self._btn(cta_row, "Build Flashable ZIP", self._start_build, bg=self.ACCENT, hover=self.ACCENT_HOVER, pad=(12, 8), size=10, bold=True)
-        self.build_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.build_btn = self._pill(cta_row, "Build Flashable ZIP", self._start_build, bg=self.ACCENT, hover=self.ACCENT_HOVER, parent_bg=self.SURFACE, pad=(14, 8), size=9, bold=True)
+        self.build_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-        self.cancel_btn = self._btn(cta_row, "Cancel", self._cancel_build, bg=self.DANGER, hover=self.DANGER_HOVER, pad=(10, 8), size=9)
-        self.cancel_btn.config(state=tk.DISABLED)
-        self.cancel_btn.pack(side=tk.RIGHT)
+        self.cancel_btn = self._pill(cta_row, "Cancel", self._cancel_build, bg=self.DANGER, hover=self.DANGER_HOVER, parent_bg=self.SURFACE, pad=(12, 8), size=9, bold=True)
+        self.cancel_btn.set_enabled(False)
+        self.cancel_btn.grid(row=0, column=1, sticky="e")
 
-        # Bottom Progress + Color-Tagged Log Console
-        prog_row = tk.Frame(outer, bg=self.BG)
-        prog_row.pack(fill=tk.X, pady=(0, 4))
+        # Guarantee right pane always fits Build + Cancel buttons cleanly at any DPI scaling.
+        right_min_w = max(290, self.build_btn.winfo_reqwidth() + self.cancel_btn.winfo_reqwidth() + 34)
+        main_pane.columnconfigure(1, weight=3, minsize=right_min_w)
 
+        # Row 2: Progress Row + Bar
+        prog_block = tk.Frame(outer, bg=self.BG)
+        prog_block.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+
+        prog_row = tk.Frame(prog_block, bg=self.BG)
+        prog_row.pack(fill=tk.X, pady=(0, 3))
         self.stage_lbl = tk.Label(prog_row, text="Ready", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.BG)
         self.stage_lbl.pack(side=tk.LEFT)
         self.stat_lbl = tk.Label(prog_row, text="", font=(self.mono_font, 8), fg=self.MUTED, bg=self.BG)
         self.stat_lbl.pack(side=tk.RIGHT)
 
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress = ttk.Progressbar(outer, style="NF.Horizontal.TProgressbar", mode="determinate", maximum=100.0, variable=self.progress_var)
-        self.progress.pack(fill=tk.X, pady=(0, 6))
+        self.progress = ttk.Progressbar(prog_block, style="NF.Horizontal.TProgressbar", mode="determinate", maximum=100.0, variable=self.progress_var)
+        self.progress.pack(fill=tk.X)
 
+        # Row 3: Compact Color-Tagged Log Console
         log_card = tk.Frame(outer, bg=self.CONSOLE, highlightthickness=1, highlightbackground=self.BORDER)
-        log_card.pack(fill=tk.X)
+        log_card.grid(row=3, column=0, sticky="ew")
 
         log_head = tk.Frame(log_card, bg=self.CONSOLE, padx=8, pady=3)
         log_head.pack(fill=tk.X)
+        self._pill(log_head, "Clear", self._clear_log, bg="#1b1f29", hover="#272d3c", parent_bg=self.CONSOLE, pad=(8, 2), size=8, pill=True, border=self.BORDER).pack(side=tk.RIGHT)
+        self._pill(log_head, "Save", self._save_log, bg="#1b1f29", hover="#272d3c", parent_bg=self.CONSOLE, pad=(8, 2), size=8, pill=True, border=self.BORDER).pack(side=tk.RIGHT, padx=(0, 4))
         tk.Label(log_head, text="Build Log", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.CONSOLE).pack(side=tk.LEFT)
-        self._btn(log_head, "Clear", self._clear_log, bg="#1b1e26", hover="#262b36", pad=(7, 1), size=8).pack(side=tk.RIGHT)
-        self._btn(log_head, "Save", self._save_log, bg="#1b1e26", hover="#262b36", pad=(7, 1), size=8).pack(side=tk.RIGHT, padx=(0, 4))
 
         log_body = tk.Frame(log_card, bg=self.CONSOLE)
         log_body.pack(fill=tk.X)
 
         self.log_text = tk.Text(
             log_body,
-            height=6,
+            height=5,
             bg=self.CONSOLE,
             fg="#cfd6e3",
             insertbackground=self.TEXT,
@@ -551,6 +850,42 @@ class NewbiesFlasherApp:
         self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         lscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def _pill(
+        self,
+        parent: tk.Widget,
+        text: str,
+        cmd: Optional[Callable[[], None]],
+        bg: str,
+        hover: str,
+        parent_bg: str,
+        fg: Optional[str] = None,
+        pad: tuple = (10, 4),
+        size: int = 8,
+        bold: bool = False,
+        min_w: int = 0,
+        min_h: int = 0,
+        pill: bool = False,
+        border: str = "",
+        clickable: bool = True,
+    ) -> PillButton:
+        return PillButton(
+            parent,
+            text=text,
+            command=cmd,
+            font_spec=(self.ui_font, size, "bold" if bold else "normal"),
+            bg=bg,
+            hover_bg=hover,
+            fg=fg or self.TEXT,
+            parent_bg=parent_bg,
+            border=border,
+            pad_x=pad[0],
+            pad_y=pad[1],
+            min_w=min_w,
+            min_h=min_h,
+            pill=pill,
+            clickable=clickable,
+        )
+
     def _make_slider_row(
         self,
         parent: tk.Widget,
@@ -562,6 +897,10 @@ class NewbiesFlasherApp:
         row = tk.Frame(parent, bg=self.SURFACE)
         row.pack(fill=tk.X, pady=(2, 4))
 
+        step_size = max(24, self._s(24))
+        minus_btn = self._pill(row, "-", lambda: slider.step(-1), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(6, 2), size=9, bold=True, min_w=step_size, min_h=step_size, pill=True, border=self.BORDER)
+        plus_btn = self._pill(row, "+", lambda: slider.step(1), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(6, 2), size=9, bold=True, min_w=step_size, min_h=step_size, pill=True, border=self.BORDER)
+
         slider = FlatSlider(
             row,
             variable=var,
@@ -571,11 +910,12 @@ class NewbiesFlasherApp:
             track_color=self.INPUT,
             fill_color=self.ACCENT,
             thumb_color=self.TEXT,
+            height=max(step_size, int(minus_btn.cget("height"))),
             on_change=on_change,
         )
-        self._btn(row, "-", lambda: slider.step(-1), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(6, 0), size=8, bold=True).pack(side=tk.LEFT, padx=(0, 4))
+        minus_btn.pack(side=tk.LEFT, padx=(0, 5))
+        plus_btn.pack(side=tk.RIGHT, padx=(5, 0))
         slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._btn(row, "+", lambda: slider.step(1), bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, pad=(5, 0), size=8, bold=True).pack(side=tk.RIGHT, padx=(4, 0))
         return slider
 
     def _bind_shortcuts(self) -> None:
@@ -583,26 +923,6 @@ class NewbiesFlasherApp:
         self.root.bind("<Control-O>", lambda _e: self._browse_folder())
         self.root.bind("<F5>", lambda _e: self._trigger_scan_now())
         self.root.bind("<Control-b>", lambda _e: self._start_build() if not self.is_building else None)
-
-    def _btn(self, parent, text, cmd, bg, hover, pad=(10, 4), size=9, bold=False) -> tk.Button:
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=cmd,
-            font=(self.ui_font, size, "bold" if bold else "normal"),
-            bg=bg,
-            fg=self.TEXT,
-            activebackground=hover,
-            activeforeground=self.TEXT,
-            disabledforeground="#666d7a",
-            relief=tk.FLAT,
-            padx=pad[0],
-            pady=pad[1],
-            cursor="hand2",
-        )
-        btn.bind("<Enter>", lambda _e: str(btn["state"]) != "disabled" and btn.config(bg=hover))
-        btn.bind("<Leave>", lambda _e: btn.config(bg=bg))
-        return btn
 
     def _grid_entry(self, parent, row: int, col: int, label: str, var: tk.StringVar, pad_right: int) -> None:
         tk.Label(parent, text=label, font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).grid(
@@ -619,7 +939,7 @@ class NewbiesFlasherApp:
             highlightthickness=1,
             highlightbackground=self.BORDER,
             highlightcolor=self.ACCENT,
-        ).grid(row=row + 1, column=col, sticky="ew", padx=(0, pad_right), pady=(1, 5), ipady=3)
+        ).grid(row=row + 1, column=col, sticky="ew", padx=(0, pad_right), pady=(1, 4), ipady=3)
 
     def _update_zstd_ui(self, lvl: int) -> None:
         if lvl == 0:
@@ -661,8 +981,8 @@ class NewbiesFlasherApp:
         fname = format_output_filename(dev, ver, code)
         self.out_name_lbl.config(text=fname)
         short_dir = self.output_dir
-        if len(short_dir) > 48:
-            short_dir = "..." + short_dir[-45:]
+        if len(short_dir) > 46:
+            short_dir = "..." + short_dir[-43:]
         self.out_dir_lbl.config(text=f"Dir: {short_dir}")
 
     def _browse_folder(self) -> None:
@@ -680,7 +1000,7 @@ class NewbiesFlasherApp:
     def _schedule_scan(self, _event=None) -> None:
         if self.scan_after_id is not None:
             self.root.after_cancel(self.scan_after_id)
-        self.scan_after_id = self.root.after(260, self._trigger_scan_now)
+        self.scan_after_id = self.root.after(240, self._trigger_scan_now)
 
     def _trigger_scan_now(self) -> None:
         self.scan_after_id = None
@@ -697,8 +1017,7 @@ class NewbiesFlasherApp:
 
         def worker():
             try:
-                parts = scan_partitions(path)
-                props = detect_build_props(path)
+                parts, props = scan_folder(path)
                 self.ui_queue.put(("scan_ok", seq, parts, props))
             except Exception as exc:
                 self.ui_queue.put(("scan_err", seq, str(exc)))
@@ -841,12 +1160,28 @@ class NewbiesFlasherApp:
         body = preview_update_binary(self._current_config())
         win = tk.Toplevel(self.root)
         win.title("Recovery Script Preview (update-binary)")
-        win.geometry("820x540")
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        pw = min(self._s(820), max(560, sw - 80))
+        ph = min(self._s(540), max(400, sh - 100))
+        win.geometry(f"{pw}x{ph}")
         win.configure(bg=self.BG)
 
         bar = tk.Frame(win, bg=self.BG, padx=10, pady=8)
         bar.pack(fill=tk.X)
         line_count = len(body.splitlines())
+
+        copy_btn = self._pill(bar, "Copy Script", None, bg=self.ACCENT, hover=self.ACCENT_HOVER, parent_bg=self.BG, pad=(12, 4), size=8, bold=True, pill=True)
+
+        def _do_copy():
+            win.clipboard_clear()
+            win.clipboard_append(body)
+            copy_btn.set_text("Copied")
+            win.after(1500, lambda: copy_btn.winfo_exists() and copy_btn.set_text("Copy Script"))
+
+        copy_btn.set_command(_do_copy)
+        copy_btn.pack(side=tk.RIGHT)
+
         tk.Label(
             bar,
             text=f"META-INF/com/google/android/update-binary ({line_count} lines)",
@@ -854,17 +1189,6 @@ class NewbiesFlasherApp:
             fg=self.MUTED,
             bg=self.BG,
         ).pack(side=tk.LEFT)
-
-        copy_btn = self._btn(bar, "Copy Script", lambda: None, bg=self.ACCENT, hover=self.ACCENT_HOVER, pad=(10, 3), size=8, bold=True)
-
-        def _do_copy():
-            win.clipboard_clear()
-            win.clipboard_append(body)
-            copy_btn.config(text="Copied")
-            win.after(1500, lambda: copy_btn.winfo_exists() and copy_btn.config(text="Copy Script"))
-
-        copy_btn.config(command=_do_copy)
-        copy_btn.pack(side=tk.RIGHT)
 
         wrap = tk.Frame(win, bg=self.CONSOLE, highlightthickness=1, highlightbackground=self.BORDER)
         wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -896,8 +1220,9 @@ class NewbiesFlasherApp:
         self.cancel_event.clear()
         self.build_start_ts = time.monotonic()
         self.progress_var.set(0.0)
-        self.build_btn.config(state=tk.DISABLED, text="Building...")
-        self.cancel_btn.config(state=tk.NORMAL)
+        self.build_btn.set_enabled(False)
+        self.build_btn.set_text("Building...")
+        self.cancel_btn.set_enabled(True)
         self.stage_lbl.config(text="Starting...", fg=self.ACCENT_HOVER)
         self.stat_lbl.config(text="0% | 0.0s")
         self._append_logs([f"--- Build started: {os.path.basename(cfg.output_zip)} ---"])
@@ -919,7 +1244,7 @@ class NewbiesFlasherApp:
 
     def _cancel_build(self) -> None:
         self.cancel_event.set()
-        self.cancel_btn.config(state=tk.DISABLED)
+        self.cancel_btn.set_enabled(False)
         self.stage_lbl.config(text="Cancelling...", fg=self.WARN)
 
     def _open_output(self) -> None:
@@ -994,15 +1319,17 @@ class NewbiesFlasherApp:
                 self.is_building = False
                 self.last_output = res.output_zip
                 self.progress_var.set(100.0)
-                self.build_btn.config(state=tk.NORMAL, text="Build Flashable ZIP")
-                self.cancel_btn.config(state=tk.DISABLED)
+                self.build_btn.set_enabled(True)
+                self.build_btn.set_text("Build Flashable ZIP")
+                self.cancel_btn.set_enabled(False)
                 self.stage_lbl.config(text=f"Complete: {os.path.basename(res.output_zip)}", fg=self.OK)
                 self.stat_lbl.config(text=f"{res.size_mb:.1f} MB | {res.elapsed_sec:.1f}s")
             elif kind == "build_err":
                 err_msg = item[1]
                 self.is_building = False
-                self.build_btn.config(state=tk.NORMAL, text="Build Flashable ZIP")
-                self.cancel_btn.config(state=tk.DISABLED)
+                self.build_btn.set_enabled(True)
+                self.build_btn.set_text("Build Flashable ZIP")
+                self.cancel_btn.set_enabled(False)
                 self.stage_lbl.config(text=f"Failed: {err_msg}", fg=self.WARN)
                 self.stat_lbl.config(text="")
                 pending_logs.append(f"ERROR: {err_msg}")

@@ -3,7 +3,7 @@ import re
 import struct
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .platform_utils import get_host_zstd
 from .sparse import parse_sparse_header_bytes
@@ -11,6 +11,8 @@ from .sparse import parse_sparse_header_bytes
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 ZSTD_SKIPPABLE_LOW = 0x184D2A50
 ZSTD_SKIPPABLE_HIGH = 0x184D2A5F
+
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", "META-INF"}
 
 DYNAMIC_PARTITIONS = {
     "system", "vendor", "product", "system_ext", "system_dlkm",
@@ -289,34 +291,80 @@ def classify_partition(name: str, path: str, fmt: str, header_bytes: Optional[by
     return "firmware"
 
 
-def scan_partitions(directory: str, zstd_bin: Optional[str] = None) -> List[PartitionImage]:
+def _parse_prop_file(fpath: str, result: Dict[str, str]) -> None:
+    try:
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = (part.strip() for part in line.split("=", 1))
+                if not v:
+                    continue
+                if k in ("ro.product.device", "ro.build.product", "ro.product.board") and not result["codename"]:
+                    result["codename"] = v
+                elif k in ("ro.product.marketname", "ro.product.model") and not result["device"]:
+                    result["device"] = v
+                elif k in ("ro.build.display.id", "ro.build.version.incremental") and not result["version"]:
+                    result["version"] = v
+    except OSError:
+        pass
+
+
+def scan_folder(
+    directory: str,
+    zstd_bin: Optional[str] = None,
+    max_depth: int = 3,
+) -> Tuple[List[PartitionImage], Dict[str, str]]:
+    """Single-pass os.scandir traversal collecting both partition images and build.prop metadata."""
+    props = {"device": "", "codename": "", "version": ""}
     if not directory or not os.path.isdir(directory):
-        return []
+        return [], props
+
+    img_candidates: List[Tuple[int, str, str, int]] = []
+    prop_candidates: List[Tuple[int, str]] = []
+    queue_dirs: List[Tuple[int, str]] = [(0, directory)]
+
+    while queue_dirs:
+        depth, cur_dir = queue_dirs.pop(0)
+        try:
+            with os.scandir(cur_dir) as it:
+                entries = sorted(it, key=lambda e: e.name.lower())
+        except OSError:
+            continue
+
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if depth < max_depth and entry.name not in _SKIP_DIRS:
+                        queue_dirs.append((depth + 1, entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+                name = entry.name
+                if name == "build.prop" or name.endswith(".prop"):
+                    prop_candidates.append((depth, entry.path))
+                    continue
+                base = strip_image_suffix(name)
+                if not base:
+                    continue
+                sz = entry.stat(follow_symlinks=True).st_size
+                if sz > 0:
+                    img_candidates.append((depth, entry.path, name, sz))
+            except OSError:
+                continue
+
+    for _, ppath in sorted(prop_candidates):
+        if all(props.values()):
+            break
+        _parse_prop_file(ppath, props)
 
     found: Dict[str, PartitionImage] = {}
-    walk_entries = []
-    for root, dirs, files in os.walk(directory):
-        dirs.sort()
-        depth = os.path.relpath(root, directory).count(os.sep) if root != directory else -1
-        for fname in sorted(files):
-            walk_entries.append((depth, root, fname))
-    walk_entries.sort(key=lambda item: (item[0], item[2].lower()))
-
-    for _, root, fname in walk_entries:
+    for _, fpath, fname, file_size in sorted(img_candidates, key=lambda x: (x[0], x[2].lower())):
         base = strip_image_suffix(fname)
         if not base or base in found:
             continue
 
-        fpath = os.path.join(root, fname)
-        try:
-            st = os.stat(fpath)
-        except OSError:
-            continue
-        file_size = st.st_size
-        if file_size == 0:
-            continue
-
-        # Single file open reads enough header bytes for ZSTD, Android sparse, and ext4/erofs/f2fs detection.
         try:
             with open(fpath, "rb") as fh:
                 head = fh.read(1088)
@@ -349,36 +397,15 @@ def scan_partitions(directory: str, zstd_bin: Optional[str] = None) -> List[Part
         )
 
     order = {"super_raw": 0, "dynamic": 1, "bootchain": 2, "firmware": 3, "bootloader": 4}
-    return sorted(found.values(), key=lambda p: (order.get(p.kind, 9), p.name))
+    parts = sorted(found.values(), key=lambda p: (order.get(p.kind, 9), p.name))
+    return parts, props
+
+
+def scan_partitions(directory: str, zstd_bin: Optional[str] = None) -> List[PartitionImage]:
+    parts, _ = scan_folder(directory, zstd_bin=zstd_bin)
+    return parts
 
 
 def detect_build_props(directory: str) -> Dict[str, str]:
-    result = {"device": "", "codename": "", "version": ""}
-    if not directory or not os.path.isdir(directory):
-        return result
-
-    for root, _, files in os.walk(directory):
-        for fname in sorted(files):
-            if not (fname == "build.prop" or fname.endswith(".prop")):
-                continue
-            fpath = os.path.join(root, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        k, v = (part.strip() for part in line.split("=", 1))
-                        if not v:
-                            continue
-                        if k in ("ro.product.device", "ro.build.product", "ro.product.board") and not result["codename"]:
-                            result["codename"] = v
-                        elif k in ("ro.product.marketname", "ro.product.model") and not result["device"]:
-                            result["device"] = v
-                        elif k in ("ro.build.display.id", "ro.build.version.incremental") and not result["version"]:
-                            result["version"] = v
-            except OSError:
-                continue
-        if all(result.values()):
-            break
-    return result
+    _, props = scan_folder(directory)
+    return props

@@ -272,6 +272,28 @@ class TestNewbiesFlasher(unittest.TestCase):
         with zipfile.ZipFile(res.output_zip, "r") as zf:
             self.assertEqual(zf.read("vendor.img"), expected_vendor)
 
+    def test_pipelined_large_image_streaming_and_meta_first_order(self) -> None:
+        sp_vendor = os.path.join(self.imgs, "vendor.img")
+        expected_vendor = _make_sparse_test_image(sp_vendor)
+        out_zip = os.path.join(self.tmp, "pipelined.zip")
+        cfg = BuildConfig(imgs_dir=self.imgs, output_zip=out_zip, zstd_level=1, zip_level=1)
+        # Lower large-image threshold to exercise overlapped compress + ZIP stream path.
+        with patch("flasher.builder.LARGE_IMAGE_BYTES", 10240):
+            res = build_package(cfg)
+        self.assertTrue(os.path.isfile(res.output_zip))
+        with zipfile.ZipFile(res.output_zip, "r") as zf:
+            names = zf.namelist()
+            self.assertLess(names.index("META-INF/com/google/android/update-binary"), names.index("system.img.zst"))
+            self.assertLess(names.index("boot.img.zst"), names.index("system.img.zst"))
+            zbin = get_host_zstd()
+            vnd_zst = os.path.join(self.tmp, "pipe_vnd.zst")
+            vnd_raw = os.path.join(self.tmp, "pipe_vnd.img")
+            with open(vnd_zst, "wb") as f:
+                f.write(zf.read("vendor.img.zst"))
+            subprocess.run([zbin, "-d", "-f", "-q", vnd_zst, "-o", vnd_raw], check=True)
+            with open(vnd_raw, "rb") as f:
+                self.assertEqual(f.read(), expected_vendor)
+
     def test_zero_copy_repack_of_precompressed_zst(self) -> None:
         zst_dir = os.path.join(self.tmp, "zst_imgs")
         os.makedirs(zst_dir)
@@ -381,6 +403,13 @@ class TestNewbiesFlasher(unittest.TestCase):
             # Ensure requested UI height fits inside a standard 768p laptop screen
             self.assertLessEqual(root.winfo_reqheight(), 680)
             self.assertEqual(len(app.tree.get_children()), len(app.partitions))
+
+            # Verify PillButton controls are enabled, clickable, and unsquished
+            self.assertTrue(app.build_btn.enabled)
+            self.assertFalse(app.cancel_btn.enabled)
+            app.build_btn.set_text("Building...")
+            self.assertEqual(app.build_btn.text, "Building...")
+            app.build_btn.set_text("Build Flashable ZIP")
 
             # Safe select must uncheck bootloader partitions (preloader_raw) and keep others
             app._select_safe_only()
