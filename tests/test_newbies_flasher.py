@@ -319,9 +319,12 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertNotIn("sha256sums.txt", ub)
             self.assertNotIn("verify_manifest", ub)
 
-            # Dynamic / super stage must execute BEFORE bootchain and firmware
-            self.assertLess(ub.index("[2/4] Dynamic / Super partitions"), ub.index("[3/4] Bootchain & AVB 2.0"))
-            self.assertLess(ub.index("[3/4] Bootchain & AVB 2.0"), ub.index("[4/4] Firmware partitions"))
+            # Dynamic / super stage must execute BEFORE bootchain, firmware, and AVB stage
+            self.assertLess(ub.index("[2/5] Dynamic / Super partitions"), ub.index("[3/5] Bootchain partitions"))
+            self.assertLess(ub.index("[3/5] Bootchain partitions"), ub.index("[4/5] Firmware partitions"))
+            self.assertLess(ub.index("[4/5] Firmware partitions"), ub.index("[5/5] AVB 2.0 Vbmeta (Disable)"))
+            self.assertIn('apply_avb_mode "disable"', ub)
+            self.assertIn("patch_vbmeta_block_dd", ub)
 
             # Verify direct sparse->zstd payload matches expected raw bytes and carries exact FCS header
             zbin = get_host_zstd()
@@ -438,6 +441,56 @@ class TestNewbiesFlasher(unittest.TestCase):
             format_output_filename("Infinix GT 20 Pro", "1.0", ""),
             "Infinix-GT-20-Pro-1.0-Flashable.zip",
         )
+        self.assertEqual(
+            format_output_filename("Infinix GT 20 Pro", "1.0", "X6871", vbmeta_only_mode="disable"),
+            "X6871-Disable-Vbmeta-Flashable.zip",
+        )
+        self.assertEqual(
+            format_output_filename("Infinix GT 20 Pro", "1.0", "X6871", vbmeta_only_mode="enable"),
+            "X6871-Enable-Vbmeta-Flashable.zip",
+        )
+
+    def test_vbmeta_standalone_disable_enable_and_skip_modes(self) -> None:
+        # Standalone Disable Vbmeta ZIP (no partition images required)
+        out_dis = os.path.join(self.tmp, "X6871-Disable-Vbmeta-Flashable.zip")
+        res_dis = build_package(BuildConfig(imgs_dir="", output_zip=out_dis, vbmeta_mode="disable"), on_log=lambda _m: None)
+        with zipfile.ZipFile(res_dis.output_zip, "r") as zf:
+            self.assertIsNone(zf.testzip())
+            names = set(zf.namelist())
+            self.assertIn("META-INF/bin/avbctl", names)
+            self.assertIn("META-INF/com/google/android/update-binary", names)
+            self.assertNotIn("META-INF/zstd", names)
+            self.assertNotIn("META-INF/bin/lptools", names)
+            ub = zf.read("META-INF/com/google/android/update-binary").decode("utf-8")
+            self.assertIn('apply_avb_mode "disable"', ub)
+            self.assertIn("patch_vbmeta_block_dd", ub)
+            self.assertNotIn("unmount_dynamic", ub)
+
+        # Standalone Enable Vbmeta ZIP
+        out_en = os.path.join(self.tmp, "X6871-Enable-Vbmeta-Flashable.zip")
+        res_en = build_package(BuildConfig(imgs_dir="", output_zip=out_en, vbmeta_mode="enable"), on_log=lambda _m: None)
+        with zipfile.ZipFile(res_en.output_zip, "r") as zf:
+            self.assertIsNone(zf.testzip())
+            self.assertIn("META-INF/bin/avbctl", zf.namelist())
+            ub = zf.read("META-INF/com/google/android/update-binary").decode("utf-8")
+            self.assertIn('apply_avb_mode "enable"', ub)
+
+        # Skip mode with no images must fail cleanly
+        with self.assertRaises(ValueError):
+            build_package(BuildConfig(imgs_dir="", output_zip=os.path.join(self.tmp, "empty.zip"), vbmeta_mode="skip"), on_log=lambda _m: None)
+
+        # Skip mode with images must not bundle avbctl or modify vbmeta.img
+        out_skip = os.path.join(self.tmp, "skip.zip")
+        res_skip = build_package(BuildConfig(imgs_dir=self.imgs, output_zip=out_skip, vbmeta_mode="skip", zstd_level=0), on_log=lambda _m: None)
+        with zipfile.ZipFile(res_skip.output_zip, "r") as zf:
+            self.assertNotIn("META-INF/bin/avbctl", zf.namelist())
+            ub = zf.read("META-INF/com/google/android/update-binary").decode("utf-8")
+            self.assertNotIn("apply_avb_mode", ub)
+            self.assertNotIn("avbctl", ub)
+            vb_tmp = os.path.join(self.tmp, "skip_vb.img")
+            with open(vb_tmp, "wb") as f:
+                f.write(zf.read("vbmeta.img"))
+            self.assertEqual(read_vbmeta_flags(vb_tmp), 0)
 
     def test_gui_defaults_sliders_naming_fits_768p_and_safe_select(self) -> None:
         import tkinter as tk
@@ -458,6 +511,17 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertEqual(app.out_name_lbl.cget("text"), "X6871-1.0-Flashable.zip")
 
             app.version_var.set("15.1.2")
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")
+
+            # Verify AVB 2.0 Skip/Disable/Enable segmented pills and standalone preview naming
+            app.vbmeta_pills["disable"]._invoke()
+            self.assertEqual(app.vbmeta_var.get(), "disable")
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-Disable-Vbmeta-Flashable.zip")
+            app.vbmeta_pills["enable"]._invoke()
+            self.assertEqual(app.vbmeta_var.get(), "enable")
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-Enable-Vbmeta-Flashable.zip")
+            app.vbmeta_pills["skip"]._invoke()
+            self.assertEqual(app.vbmeta_var.get(), "skip")
             self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")
 
             # Verify ZSTD and ZIP sliders step cleanly without snapping back and sync labels

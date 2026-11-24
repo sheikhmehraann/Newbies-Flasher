@@ -71,7 +71,12 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 
 
-def format_output_filename(device: str, version: str, codename: str = "") -> str:
+def format_output_filename(
+    device: str,
+    version: str,
+    codename: str = "",
+    vbmeta_only_mode: str = "",
+) -> str:
     def clean(val: str) -> str:
         s = re.sub(r"[\s_]+", "-", str(val or "").strip())
         s = re.sub(r"[^a-zA-Z0-9.-]", "", s)
@@ -81,6 +86,9 @@ def format_output_filename(device: str, version: str, codename: str = "") -> str
     dev = clean(device) or "Device"
     ver = clean(version) or "1.0"
     primary = code or dev
+    if vbmeta_only_mode in ("disable", "enable"):
+        tag = "Disable-Vbmeta" if vbmeta_only_mode == "disable" else "Enable-Vbmeta"
+        return f"{primary}-{tag}-Flashable.zip"
     return f"{primary}-{ver}-Flashable.zip"
 
 
@@ -317,7 +325,12 @@ def _run_zstd_decompress(
 
 def preview_update_binary(cfg: BuildConfig) -> str:
     zstd_bin = get_host_zstd()
-    parts = cfg.partitions if cfg.partitions is not None else scan_partitions(cfg.imgs_dir, zstd_bin=zstd_bin)
+    if cfg.partitions is not None:
+        parts = cfg.partitions
+    elif cfg.imgs_dir and os.path.isdir(cfg.imgs_dir):
+        parts = scan_partitions(cfg.imgs_dir, zstd_bin=zstd_bin)
+    else:
+        parts = []
     selected = [p for p in parts if p.selected]
 
     use_zstd = cfg.zstd_level > 0
@@ -490,9 +503,14 @@ def build_package(
     ext = ".img.zst" if use_zstd else ".img"
 
     progress(2.0, "Scanning partitions")
-    all_parts = cfg.partitions if cfg.partitions is not None else scan_partitions(cfg.imgs_dir, zstd_bin=zstd_bin)
+    if cfg.partitions is not None:
+        all_parts = cfg.partitions
+    elif cfg.imgs_dir and os.path.isdir(cfg.imgs_dir):
+        all_parts = scan_partitions(cfg.imgs_dir, zstd_bin=zstd_bin)
+    else:
+        all_parts = []
     selected = [p for p in all_parts if p.selected]
-    if not selected:
+    if not selected and cfg.vbmeta_mode not in ("disable", "enable"):
         raise ValueError("No partition images selected for packaging.")
 
     needs_zstd = (
@@ -670,7 +688,7 @@ def build_package(
 
         meta_entries: List[Tuple[str, str, bool]] = []
         dev_bins = get_device_binaries()
-        if use_zstd and "zstd-arm64" in dev_bins:
+        if use_zstd and selected and "zstd-arm64" in dev_bins:
             meta_entries.append((str(dev_bins["zstd-arm64"]), "META-INF/zstd", True))
         if dyn_specs and "lptools" in dev_bins:
             meta_entries.append((str(dev_bins["lptools"]), "META-INF/bin/lptools", True))

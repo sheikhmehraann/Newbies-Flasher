@@ -313,13 +313,18 @@ def cli_flow() -> None:
         return
 
     imgs_path = clean_path(args.imgs_path or "")
-    if not imgs_path or not os.path.isdir(imgs_path):
-        parser.error(f"Images directory not found: {args.imgs_path}")
-
-    parts, props = scan_folder(imgs_path)
-    if not parts:
-        print(f"Error: no .img or .img.zst files found in {imgs_path}")
-        sys.exit(1)
+    if imgs_path:
+        if not os.path.isdir(imgs_path):
+            parser.error(f"Images directory not found: {args.imgs_path}")
+        parts, props = scan_folder(imgs_path)
+        if not parts and args.vbmeta == "skip":
+            print(f"Error: no .img or .img.zst files found in {imgs_path}")
+            sys.exit(1)
+    elif args.vbmeta in ("disable", "enable"):
+        parts = []
+        props = {"device": "", "codename": "", "version": ""}
+    else:
+        parser.error("Provide --imgs <folder>, or use --vbmeta disable/enable for a standalone vbmeta ZIP.")
 
     device = args.device if args.device is not None else (props["device"] or DEFAULT_DEVICE)
     codename = args.codename if args.codename is not None else (props["codename"] or DEFAULT_CODENAME)
@@ -332,8 +337,9 @@ def cli_flow() -> None:
 
     out_dir = os.path.join(ROOT_DIR, "output")
     os.makedirs(out_dir, exist_ok=True)
+    vb_only = args.vbmeta if (not any(p.selected for p in parts) and args.vbmeta in ("disable", "enable")) else ""
     out_zip = clean_path(args.output) if args.output else os.path.join(
-        out_dir, format_output_filename(device, version, codename)
+        out_dir, format_output_filename(device, version, codename, vbmeta_only_mode=vb_only)
     )
 
     cfg = BuildConfig(

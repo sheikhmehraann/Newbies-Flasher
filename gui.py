@@ -234,6 +234,13 @@ class PillButton(tk.Canvas):
     def set_command(self, cmd: Optional[Callable[[], None]]) -> None:
         self._command = cmd
 
+    def set_colors(self, bg: str, hover_bg: str, fg: str, border: str = "") -> None:
+        self._bg = bg
+        self._hover_bg = hover_bg
+        self._fg = fg
+        self._border = border
+        self._refresh_colors()
+
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
         if not self._enabled:
@@ -481,21 +488,6 @@ class NewbiesFlasherApp:
             darkcolor=self.ACCENT,
             thickness=max(6, self._s(7)),
         )
-        style.configure(
-            "NF.TCombobox",
-            fieldbackground=self.INPUT,
-            background=self.SURFACE_ALT,
-            foreground=self.TEXT,
-            arrowcolor=self.TEXT,
-            bordercolor=self.BORDER,
-            padding=4,
-        )
-        style.map(
-            "NF.TCombobox",
-            fieldbackground=[("readonly", self.INPUT)],
-            selectbackground=[("readonly", self.SURFACE_ALT)],
-            selectforeground=[("readonly", self.TEXT)],
-        )
 
     def _build_layout(self) -> None:
         outer = tk.Frame(self.root, bg=self.BG)
@@ -731,15 +723,34 @@ class NewbiesFlasherApp:
         self._grid_entry(meta_grid, 2, 0, "Version", self.version_var, pad_right=6)
         self._grid_entry(meta_grid, 2, 1, "Maintainer", self.maintainer_var, pad_right=0)
 
-        tk.Label(opt_body, text="AVB 2.0 (top-level vbmeta)", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(anchor=tk.W, pady=(2, 1))
+        tk.Label(opt_body, text="AVB 2.0 (vbmeta)", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(anchor=tk.W, pady=(2, 2))
         self.vbmeta_var = tk.StringVar(value="skip")
-        ttk.Combobox(
-            opt_body,
-            textvariable=self.vbmeta_var,
-            values=("skip", "disable", "enable"),
-            state="readonly",
-            style="NF.TCombobox",
-        ).pack(fill=tk.X, pady=(0, 6))
+        vb_row = tk.Frame(opt_body, bg=self.SURFACE)
+        vb_row.pack(fill=tk.X, pady=(0, 2))
+        self.vbmeta_pills = {}
+        for col_i, (mode, label) in enumerate((("skip", "Skip"), ("disable", "Disable"), ("enable", "Enable"))):
+            vb_row.columnconfigure(col_i, weight=1)
+            pbtn = self._pill(
+                vb_row,
+                label,
+                lambda m=mode: self.vbmeta_var.set(m),
+                bg=self.INPUT,
+                hover=self.SURFACE_HOVER,
+                fg=self.MUTED,
+                parent_bg=self.SURFACE,
+                pad=(8, 4),
+                size=8,
+                bold=True,
+                pill=True,
+                border=self.BORDER,
+            )
+            pbtn.grid(row=0, column=col_i, sticky="ew", padx=(0 if col_i == 0 else 4, 0))
+            self.vbmeta_pills[mode] = pbtn
+
+        self.vbmeta_hint_lbl = tk.Label(opt_body, text="", font=(self.ui_font, 7), fg=self.MUTED, bg=self.SURFACE, anchor=tk.W)
+        self.vbmeta_hint_lbl.pack(fill=tk.X, pady=(0, 5))
+        self.vbmeta_var.trace_add("write", lambda *_: self._update_vbmeta_ui())
+        self._update_vbmeta_ui()
 
         # ZSTD Compression Slider (0..22)
         z_head = tk.Frame(opt_body, bg=self.SURFACE)
@@ -975,11 +986,35 @@ class NewbiesFlasherApp:
             self.zip_lbl.config(text=f"Level {lvl} ({note})", fg=self.ACCENT_HOVER)
             self.zip_slider.set_fill_color(self.ACCENT)
 
+    def _update_vbmeta_ui(self) -> None:
+        mode = self.vbmeta_var.get()
+        active_palette = {
+            "skip": (self.ACCENT, self.ACCENT_HOVER, self.TEXT, self.ACCENT),
+            "disable": ("#b86a19", "#cf7b24", self.TEXT, "#cf7b24"),
+            "enable": ("#278255", "#329c68", self.TEXT, "#329c68"),
+        }
+        hints = {
+            "skip": "Leave vbmeta untouched (requires partition images)",
+            "disable": "Disable verity & verification via avbctl (works standalone too)",
+            "enable": "Enable verity & verification via avbctl (works standalone too)",
+        }
+        for key, pill in self.vbmeta_pills.items():
+            if key == mode:
+                pill.set_colors(*active_palette[key])
+            else:
+                pill.set_colors(self.INPUT, self.SURFACE_HOVER, self.MUTED, self.BORDER)
+        self.vbmeta_hint_lbl.config(text=hints.get(mode, ""))
+        if hasattr(self, "out_name_lbl"):
+            self._update_output_preview()
+
     def _update_output_preview(self) -> None:
         dev = self.device_var.get().strip() or DEFAULT_DEVICE
         code = self.codename_var.get().strip()
         ver = self.version_var.get().strip() or DEFAULT_VERSION
-        fname = format_output_filename(dev, ver, code)
+        mode = self.vbmeta_var.get() if hasattr(self, "vbmeta_var") else "skip"
+        has_sel = any(p.selected for p in self.partitions)
+        vb_only = mode if (not has_sel and mode in ("disable", "enable")) else ""
+        fname = format_output_filename(dev, ver, code, vbmeta_only_mode=vb_only)
         self.out_name_lbl.config(text=fname)
         short_dir = self.output_dir
         if len(short_dir) > 46:
@@ -987,7 +1022,9 @@ class NewbiesFlasherApp:
         self.out_dir_lbl.config(text=f"Dir: {short_dir}")
 
     def _browse_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Select Partition Images Folder")
+        cur = self.path_var.get().strip().strip('"').strip("'")
+        init = cur if os.path.isdir(cur) else ROOT_DIR
+        folder = filedialog.askdirectory(title="Select Partition Images Folder", initialdir=init)
         if folder:
             self.path_var.set(os.path.abspath(folder))
             self._trigger_scan_now()
@@ -1068,6 +1105,8 @@ class NewbiesFlasherApp:
         self.sel_summary_lbl.config(
             text=f"Selected: {sel_count}/{len(self.partitions)} | Raw: {_fmt_size(sel_raw)}"
         )
+        if hasattr(self, "out_name_lbl"):
+            self._update_output_preview()
 
     def _toggle_index(self, idx: int) -> None:
         if 0 <= idx < len(self.partitions):
@@ -1104,7 +1143,10 @@ class NewbiesFlasherApp:
         maint = self.maintainer_var.get().strip() or DEFAULT_MAINTAINER
 
         os.makedirs(self.output_dir, exist_ok=True)
-        out_zip = os.path.join(self.output_dir, format_output_filename(dev, ver, code))
+        mode = self.vbmeta_var.get()
+        has_sel = any(p.selected for p in self.partitions)
+        vb_only = mode if (not has_sel and mode in ("disable", "enable")) else ""
+        out_zip = os.path.join(self.output_dir, format_output_filename(dev, ver, code, vbmeta_only_mode=vb_only))
 
         return BuildConfig(
             imgs_dir=imgs_dir,
@@ -1113,7 +1155,7 @@ class NewbiesFlasherApp:
             codename=code,
             version=ver,
             maintainer=maint,
-            vbmeta_mode=self.vbmeta_var.get(),
+            vbmeta_mode=mode,
             zstd_level=self.zstd_var.get(),
             zip_level=self.zip_var.get(),
             partitions=list(self.partitions),
@@ -1154,8 +1196,9 @@ class NewbiesFlasherApp:
                 f.write(self.log_text.get("1.0", tk.END))
 
     def _open_script_preview(self) -> None:
-        if not any(p.selected for p in self.partitions):
-            messagebox.showinfo("Newbies Flasher", "Select a folder with at least one checked partition first.")
+        has_sel = any(p.selected for p in self.partitions)
+        if not has_sel and self.vbmeta_var.get() == "skip":
+            messagebox.showinfo("Newbies Flasher", "Select a folder with at least one checked partition, or pick Disable/Enable AVB 2.0.")
             return
 
         body = preview_update_binary(self._current_config())
@@ -1210,11 +1253,12 @@ class NewbiesFlasherApp:
 
     def _start_build(self) -> None:
         cfg = self._current_config()
-        if not cfg.imgs_dir or not os.path.isdir(cfg.imgs_dir):
-            self.stage_lbl.config(text="Select a valid images folder first", fg=self.WARN)
-            return
-        if not any(p.selected for p in cfg.partitions or []):
-            self.stage_lbl.config(text="Check at least one partition to package", fg=self.WARN)
+        has_sel = any(p.selected for p in cfg.partitions or [])
+        if not has_sel and cfg.vbmeta_mode == "skip":
+            if not cfg.imgs_dir or not os.path.isdir(cfg.imgs_dir):
+                self.stage_lbl.config(text="Select an images folder, or set AVB 2.0 to Disable/Enable", fg=self.WARN)
+            else:
+                self.stage_lbl.config(text="Check at least one partition to package", fg=self.WARN)
             return
 
         self.is_building = True

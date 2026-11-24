@@ -20,7 +20,9 @@ Requires Python 3.8 or newer. No external Python packages are needed.
   - Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
   - Reports byte-weighted recovery progress and total flash time.
 - Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Skip Bootloader` in GUI).
-- Supports safe AVB 2.0 flag patching on top-level `vbmeta` only (leaves chained `vbmeta_system` and `vbmeta_vendor` flags at 0 so `libavb` does not reject them).
+- Supports AVB 2.0 `skip`, `disable`, and `enable` modes both inside full ROM packages and as standalone `Disable-Vbmeta` / `Enable-Vbmeta` flashable ZIPs:
+  - Patches top-level `vbmeta` flags only (leaves chained `vbmeta_system` and `vbmeta_vendor` at 0 so `libavb` does not reject them).
+  - Runs live `avbctl get-verity` / `get-verification` status checks on device before applying `--force disable/enable-verity` and `--force disable/enable-verification`, with automatic direct `AVB0` header fallback if `avbctl` is unavailable in recovery.
 - Probes bundled binaries before using them and falls back to system `zstd` or Python `zstandard` automatically on any CPU or OS.
 
 ## Quick Start
@@ -69,9 +71,10 @@ chmod +x run_termux.sh
 1. Click **Browse...** (`Ctrl+O`) and pick the folder containing your `.img` or `.img.zst` files.
 2. Review the color-coded partition list (click any column header to sort). Click any row (or press Space) to include or exclude specific partitions, or click **Skip Bootloader**.
 3. Check Device Name, Codename, Version, and Maintainer (defaults to `Infinix GT 20 Pro` / `X6871` as an example, and auto-fills if a `build.prop` is present).
-4. Pick AVB mode (`skip`, `disable`, `enable`) and adjust the ZSTD / ZIP sliders (drag, click anywhere on the bar, scroll, or use `-` / `+`).
+4. Pick AVB 2.0 mode (**Skip**, **Disable**, or **Enable**) and adjust the ZSTD / ZIP sliders (drag, click anywhere on the bar, scroll, or use `-` / `+`).
+   - Selecting **Disable** or **Enable** with no partition images builds a standalone `Codename-Disable-Vbmeta-Flashable.zip` or `Codename-Enable-Vbmeta-Flashable.zip`.
    - ZSTD Level `1` gives the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.
-   - ZIP Level only applies to scripts when ZSTD is enabled, or to raw `.img` files when ZSTD is `0`.
+   - ZIP Level applies to scripts when ZSTD is enabled, or to raw `.img` files when ZSTD is `0`.
 5. Check the live Output ZIP preview (`X6871-1.0-Flashable.zip`) and click **Change Folder...** if you want a custom output directory.
 6. Click **Preview Script** to inspect or copy the generated `update-binary` before building.
 7. Click **Build Flashable ZIP** (`Ctrl+B`).
