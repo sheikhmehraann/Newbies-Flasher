@@ -21,7 +21,7 @@ from flasher.builder import (
     BuildResult,
     build_package,
     format_output_filename,
-    preview_scripts,
+    preview_update_binary,
 )
 from flasher.partitions import PartitionImage, detect_build_props, scan_partitions
 from flasher.platform_utils import (
@@ -30,6 +30,11 @@ from flasher.platform_utils import (
     has_python_zstandard,
     reveal_in_file_manager,
 )
+
+DEFAULT_DEVICE = "Infinix GT 20 Pro"
+DEFAULT_CODENAME = "X6871"
+DEFAULT_VERSION = "1.0"
+DEFAULT_MAINTAINER = "User"
 
 
 def _enable_windows_dpi() -> None:
@@ -80,6 +85,9 @@ class NewbiesFlasherApp:
     DANGER_HOVER = "#d85757"
     OK = "#38b377"
     WARN = "#e0a538"
+    DYNAMIC_FG = "#79b8ff"
+    SUPER_FG = "#b392f0"
+    BOOT_FG = "#69d49d"
     CONSOLE = "#0d0f13"
 
     def __init__(self, root: tk.Tk):
@@ -102,16 +110,22 @@ class NewbiesFlasherApp:
         self.mono_font = "Consolas" if sys.platform == "win32" else ("Menlo" if sys.platform == "darwin" else "Monospace")
 
         self.partitions: List[PartitionImage] = []
+        self.output_dir: str = os.path.join(ROOT_DIR, "output")
         self.last_output: Optional[str] = None
         self.cancel_event = threading.Event()
         self.build_thread: Optional[threading.Thread] = None
         self.build_start_ts: float = 0.0
         self.scan_after_id: Optional[str] = None
+        self.poll_after_id: Optional[str] = None
         self.scan_seq = 0
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
 
         self._setup_styles()
         self._build_layout()
+        self._bind_shortcuts()
+        self._update_output_preview()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Destroy>", self._on_destroy)
         self._poll_queue()
 
     def _setup_styles(self) -> None:
@@ -202,7 +216,7 @@ class NewbiesFlasherApp:
         ).pack(side=tk.LEFT, pady=(2, 0))
 
         self._btn(top, "Open Output", self._open_output, bg=self.SURFACE_ALT, hover="#2e3543", pad=(10, 4), size=9).pack(side=tk.RIGHT)
-        self._btn(top, "Preview Scripts", self._open_script_preview, bg=self.SURFACE_ALT, hover="#2e3543", pad=(10, 4), size=9).pack(side=tk.RIGHT, padx=(0, 6))
+        self._btn(top, "Preview Script", self._open_script_preview, bg=self.SURFACE_ALT, hover="#2e3543", pad=(10, 4), size=9).pack(side=tk.RIGHT, padx=(0, 6))
 
         # Main Two-Pane Workspace
         main_pane = tk.Frame(outer, bg=self.BG)
@@ -259,6 +273,9 @@ class NewbiesFlasherApp:
         self.tree.column("raw", width=80, anchor=tk.E, stretch=False)
         self.tree.column("disk", width=80, anchor=tk.E, stretch=False)
 
+        self.tree.tag_configure("dynamic", foreground=self.DYNAMIC_FG)
+        self.tree.tag_configure("super_raw", foreground=self.SUPER_FG)
+        self.tree.tag_configure("bootchain", foreground=self.BOOT_FG)
         self.tree.tag_configure("bootloader", foreground=self.WARN)
         self.tree.tag_configure("unchecked", foreground="#5d6678")
 
@@ -276,10 +293,10 @@ class NewbiesFlasherApp:
         self._btn(sel_bar, "All", lambda: self._set_all_selected(True), bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 4))
         self._btn(sel_bar, "None", lambda: self._set_all_selected(False), bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 4))
         self._btn(sel_bar, "Safe (skip bootloader)", self._select_safe_only, bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 2), size=8).pack(side=tk.LEFT)
-        self.sel_summary_lbl = tk.Label(sel_bar, text="Selected: 0 / 0", font=(self.ui_font, 8), fg=self.MUTED, bg=self.SURFACE)
+        self.sel_summary_lbl = tk.Label(sel_bar, text="Selected: 0/0", font=(self.ui_font, 8), fg=self.MUTED, bg=self.SURFACE)
         self.sel_summary_lbl.pack(side=tk.RIGHT)
 
-        # Right Pane: Compact ROM metadata, options, and primary Build CTA
+        # Right Pane: ROM metadata, compression, output path, and Build CTA
         right_card = tk.Frame(main_pane, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=12, pady=8, width=370)
         right_card.pack(side=tk.RIGHT, fill=tk.Y)
         right_card.pack_propagate(False)
@@ -291,10 +308,13 @@ class NewbiesFlasherApp:
         meta_grid.columnconfigure(0, weight=1)
         meta_grid.columnconfigure(1, weight=1)
 
-        self.device_var = tk.StringVar(value="Android Device")
-        self.codename_var = tk.StringVar(value="")
-        self.version_var = tk.StringVar(value="1.0")
-        self.maintainer_var = tk.StringVar(value="User")
+        self.device_var = tk.StringVar(value=DEFAULT_DEVICE)
+        self.codename_var = tk.StringVar(value=DEFAULT_CODENAME)
+        self.version_var = tk.StringVar(value=DEFAULT_VERSION)
+        self.maintainer_var = tk.StringVar(value=DEFAULT_MAINTAINER)
+
+        for var in (self.device_var, self.codename_var, self.version_var):
+            var.trace_add("write", lambda *_: self._update_output_preview())
 
         self._grid_entry(meta_grid, 0, 0, "Device Name", self.device_var, pad_right=6)
         self._grid_entry(meta_grid, 0, 1, "Codename", self.codename_var, pad_right=0)
@@ -335,27 +355,41 @@ class NewbiesFlasherApp:
             variable=self.zip_var, command=self._on_zip_change, style="NF.Horizontal.TScale",
         ).pack(fill=tk.X, pady=(1, 6))
 
-        self.fastboot_var = tk.BooleanVar(value=True)
-        self.sha256_var = tk.BooleanVar(value=True)
         self.clean_super_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            right_card,
+            text="Clean stale dynamic partitions in super",
+            variable=self.clean_super_var,
+            bg=self.SURFACE,
+            fg=self.TEXT,
+            selectcolor=self.INPUT,
+            activebackground=self.SURFACE,
+            activeforeground=self.TEXT,
+            font=(self.ui_font, 8),
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 6))
 
-        for text, var in (
-            ("Include Fastboot scripts (Win/Linux/Mac/Termux)", self.fastboot_var),
-            ("Verify SHA-256 checksums before flashing", self.sha256_var),
-            ("Clean stale dynamic partitions in super", self.clean_super_var),
-        ):
-            tk.Checkbutton(
-                right_card,
-                text=text,
-                variable=var,
-                bg=self.SURFACE,
-                fg=self.TEXT,
-                selectcolor=self.INPUT,
-                activebackground=self.SURFACE,
-                activeforeground=self.TEXT,
-                font=(self.ui_font, 8),
-                anchor=tk.W,
-            ).pack(fill=tk.X, pady=1)
+        out_head = tk.Frame(right_card, bg=self.SURFACE)
+        out_head.pack(fill=tk.X)
+        tk.Label(out_head, text="Output ZIP", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
+        self._btn(out_head, "Change Folder...", self._browse_output_dir, bg=self.SURFACE_ALT, hover="#2e3543", pad=(6, 1), size=8).pack(side=tk.RIGHT)
+
+        self.out_name_lbl = tk.Label(
+            right_card,
+            text="",
+            font=(self.mono_font, 8),
+            fg=self.TEXT,
+            bg=self.INPUT,
+            anchor=tk.W,
+            padx=6,
+            pady=4,
+            highlightthickness=1,
+            highlightbackground=self.BORDER,
+        )
+        self.out_name_lbl.pack(fill=tk.X, pady=(2, 2))
+
+        self.out_dir_lbl = tk.Label(right_card, text="", font=(self.ui_font, 7), fg=self.MUTED, bg=self.SURFACE, anchor=tk.W)
+        self.out_dir_lbl.pack(fill=tk.X)
 
         cta_row = tk.Frame(right_card, bg=self.SURFACE)
         cta_row.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
@@ -408,6 +442,12 @@ class NewbiesFlasherApp:
         self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         lscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def _bind_shortcuts(self) -> None:
+        self.root.bind("<Control-o>", lambda _e: self._browse_folder())
+        self.root.bind("<Control-O>", lambda _e: self._browse_folder())
+        self.root.bind("<F5>", lambda _e: self._trigger_scan_now())
+        self.root.bind("<Control-b>", lambda _e: self._start_build() if str(self.build_btn["state"]) != "disabled" else None)
+
     def _btn(self, parent, text, cmd, bg, hover, pad=(10, 4), size=9, bold=False) -> tk.Button:
         return tk.Button(
             parent,
@@ -442,6 +482,17 @@ class NewbiesFlasherApp:
             highlightcolor=self.ACCENT,
         ).grid(row=row + 1, column=col, sticky="ew", padx=(0, pad_right), pady=(1, 5), ipady=3)
 
+    def _update_output_preview(self) -> None:
+        dev = self.device_var.get().strip() or DEFAULT_DEVICE
+        code = self.codename_var.get().strip()
+        ver = self.version_var.get().strip() or DEFAULT_VERSION
+        fname = format_output_filename(dev, ver, code)
+        self.out_name_lbl.config(text=fname)
+        short_dir = self.output_dir
+        if len(short_dir) > 48:
+            short_dir = "..." + short_dir[-45:]
+        self.out_dir_lbl.config(text=f"Dir: {short_dir}")
+
     def _on_zstd_change(self, val: str) -> None:
         lvl = int(float(val))
         self.zstd_var.set(lvl)
@@ -459,6 +510,12 @@ class NewbiesFlasherApp:
         if folder:
             self.path_var.set(os.path.abspath(folder))
             self._trigger_scan_now()
+
+    def _browse_output_dir(self) -> None:
+        folder = filedialog.askdirectory(title="Select Output Folder", initialdir=self.output_dir if os.path.isdir(self.output_dir) else ROOT_DIR)
+        if folder:
+            self.output_dir = os.path.abspath(folder)
+            self._update_output_preview()
 
     def _schedule_scan(self, _event=None) -> None:
         if self.scan_after_id is not None:
@@ -500,8 +557,8 @@ class NewbiesFlasherApp:
             tags = ()
             if not p.selected:
                 tags = ("unchecked",)
-            elif p.kind == "bootloader":
-                tags = ("bootloader",)
+            elif p.kind in ("dynamic", "super_raw", "bootchain", "bootloader"):
+                tags = (p.kind,)
             self.tree.insert(
                 "",
                 tk.END,
@@ -540,14 +597,13 @@ class NewbiesFlasherApp:
 
     def _current_config(self) -> BuildConfig:
         imgs_dir = self.path_var.get().strip().strip('"').strip("'")
-        dev = self.device_var.get().strip() or "Android Device"
+        dev = self.device_var.get().strip() or DEFAULT_DEVICE
         code = self.codename_var.get().strip()
-        ver = self.version_var.get().strip() or "1.0"
-        maint = self.maintainer_var.get().strip() or "User"
+        ver = self.version_var.get().strip() or DEFAULT_VERSION
+        maint = self.maintainer_var.get().strip() or DEFAULT_MAINTAINER
 
-        out_dir = os.path.join(ROOT_DIR, "output")
-        os.makedirs(out_dir, exist_ok=True)
-        out_zip = os.path.join(out_dir, format_output_filename(dev, ver, code))
+        os.makedirs(self.output_dir, exist_ok=True)
+        out_zip = os.path.join(self.output_dir, format_output_filename(dev, ver, code))
 
         return BuildConfig(
             imgs_dir=imgs_dir,
@@ -559,8 +615,6 @@ class NewbiesFlasherApp:
             vbmeta_mode=self.vbmeta_var.get(),
             zstd_level=self.zstd_var.get(),
             zip_level=self.zip_var.get(),
-            include_fastboot=self.fastboot_var.get(),
-            verify_sha256=self.sha256_var.get(),
             clean_super=self.clean_super_var.get(),
             partitions=list(self.partitions),
         )
@@ -591,28 +645,50 @@ class NewbiesFlasherApp:
             messagebox.showinfo("Newbies Flasher", "Select a folder with at least one checked partition first.")
             return
 
-        scripts = preview_scripts(self._current_config())
+        body = preview_update_binary(self._current_config())
         win = tk.Toplevel(self.root)
-        win.title("Generated Scripts Preview")
-        win.geometry("800x540")
+        win.title("Recovery Script Preview (update-binary)")
+        win.geometry("820x540")
         win.configure(bg=self.BG)
 
-        nb = ttk.Notebook(win)
-        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        bar = tk.Frame(win, bg=self.BG, padx=10, pady=8)
+        bar.pack(fill=tk.X)
+        line_count = len(body.splitlines())
+        tk.Label(
+            bar,
+            text=f"META-INF/com/google/android/update-binary ({line_count} lines)",
+            font=(self.ui_font, 9, "bold"),
+            fg=self.MUTED,
+            bg=self.BG,
+        ).pack(side=tk.LEFT)
 
-        for name, body in scripts.items():
-            frame = tk.Frame(nb, bg=self.CONSOLE)
-            txt = tk.Text(
-                frame, bg=self.CONSOLE, fg="#d5dae3", font=(self.mono_font, 9),
-                relief=tk.FLAT, padx=10, pady=8, wrap=tk.NONE,
-            )
-            yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=txt.yview)
-            txt.configure(yscrollcommand=yscroll.set)
-            txt.insert("1.0", body)
-            txt.config(state=tk.DISABLED)
-            txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-            nb.add(frame, text=os.path.basename(name))
+        copy_btn = self._btn(bar, "Copy Script", lambda: None, bg=self.ACCENT, hover=self.ACCENT_HOVER, pad=(10, 3), size=8, bold=True)
+
+        def _do_copy():
+            win.clipboard_clear()
+            win.clipboard_append(body)
+            copy_btn.config(text="Copied")
+            win.after(1500, lambda: copy_btn.winfo_exists() and copy_btn.config(text="Copy Script"))
+
+        copy_btn.config(command=_do_copy)
+        copy_btn.pack(side=tk.RIGHT)
+
+        wrap = tk.Frame(win, bg=self.CONSOLE, highlightthickness=1, highlightbackground=self.BORDER)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        txt = tk.Text(
+            wrap, bg=self.CONSOLE, fg="#d5dae3", font=(self.mono_font, 9),
+            relief=tk.FLAT, padx=10, pady=8, wrap=tk.NONE,
+        )
+        yscroll = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=txt.yview)
+        xscroll = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=txt.xview)
+        txt.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        txt.insert("1.0", body)
+        txt.config(state=tk.DISABLED)
+
+        xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     def _start_build(self) -> None:
         cfg = self._current_config()
@@ -652,11 +728,36 @@ class NewbiesFlasherApp:
         self.stage_lbl.config(text="Cancelling...", fg=self.WARN)
 
     def _open_output(self) -> None:
-        target = self.last_output if (self.last_output and os.path.isfile(self.last_output)) else os.path.join(ROOT_DIR, "output")
-        os.makedirs(os.path.join(ROOT_DIR, "output"), exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+        target = self.last_output if (self.last_output and os.path.isfile(self.last_output)) else self.output_dir
         reveal_in_file_manager(target)
 
+    def _on_close(self) -> None:
+        self.cancel_event.set()
+        self._cancel_timers()
+        self.root.destroy()
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self.root:
+            self._cancel_timers()
+
+    def _cancel_timers(self) -> None:
+        for attr in ("poll_after_id", "scan_after_id"):
+            tid = getattr(self, attr, None)
+            if tid is not None:
+                try:
+                    self.root.after_cancel(tid)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+
     def _poll_queue(self) -> None:
+        self.poll_after_id = None
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
         while True:
             try:
                 item = self.ui_queue.get_nowait()
@@ -674,11 +775,11 @@ class NewbiesFlasherApp:
                     self.scan_lbl.config(text=f"Found {len(parts)} image(s)", fg=self.OK)
                 else:
                     self.scan_lbl.config(text="No .img or .img.zst files found", fg=self.WARN)
-                if props["device"] and self.device_var.get() in ("", "Android Device"):
+                if props["device"] and self.device_var.get() in ("", DEFAULT_DEVICE):
                     self.device_var.set(props["device"])
-                if props["codename"] and not self.codename_var.get():
+                if props["codename"] and self.codename_var.get() in ("", DEFAULT_CODENAME):
                     self.codename_var.set(props["codename"])
-                if props["version"] and self.version_var.get() in ("", "1.0"):
+                if props["version"] and self.version_var.get() in ("", DEFAULT_VERSION):
                     self.version_var.set(props["version"])
 
             elif kind == "scan_err":
@@ -710,7 +811,7 @@ class NewbiesFlasherApp:
                 self.stage_lbl.config(text=f"Failed: {err_msg}", fg=self.WARN)
                 self._append_log(f"ERROR: {err_msg}")
 
-        self.root.after(40, self._poll_queue)
+        self.poll_after_id = self.root.after(40, self._poll_queue)
 
 
 def launch_gui() -> None:

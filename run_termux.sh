@@ -11,7 +11,6 @@ fi
 missing=""
 command -v python >/dev/null 2>&1 || missing="$missing python"
 command -v zstd >/dev/null 2>&1 || missing="$missing zstd"
-command -v fastboot >/dev/null 2>&1 || missing="$missing android-tools"
 
 if [ -n "$missing" ]; then
     echo "Installing Termux packages:$missing"

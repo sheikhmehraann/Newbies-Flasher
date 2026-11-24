@@ -1,4 +1,3 @@
-import hashlib
 import os
 import re
 import shutil
@@ -9,20 +8,13 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .avb import is_top_level_vbmeta, patch_vbmeta_flags
-from .fastboot_scripts import (
-    generate_linux_fastboot,
-    generate_macos_fastboot,
-    generate_termux_fastboot,
-    generate_windows_fastboot,
-)
 from .partitions import PartitionImage, scan_partitions
 from .platform_utils import (
     ROOT_DIR,
     get_device_binaries,
-    get_fastboot_bundle_assets,
     get_host_zstd,
     has_python_zstandard,
 )
@@ -38,15 +30,13 @@ ALREADY_COMPRESSED_EXTS = (".zst", ".gz", ".xz", ".bz2", ".lz4", ".zip")
 class BuildConfig:
     imgs_dir: str
     output_zip: str
-    device: str = "Android Device"
-    codename: str = ""
+    device: str = "Infinix GT 20 Pro"
+    codename: str = "X6871"
     version: str = "1.0"
     maintainer: str = "User"
     vbmeta_mode: str = "skip"
     zstd_level: int = 1
     zip_level: int = 1
-    include_fastboot: bool = True
-    verify_sha256: bool = True
     clean_super: bool = True
     partitions: Optional[List[PartitionImage]] = None
 
@@ -105,28 +95,6 @@ def sanitize_output_path(output_zip: str) -> str:
     if not clean_base.lower().endswith(".zip"):
         clean_base += ".zip"
     return os.path.join(out_dir, clean_base) if out_dir else clean_base
-
-
-def _fast_link_or_copy(src: str, dst: str) -> None:
-    if os.path.exists(dst):
-        os.remove(dst)
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
-
-
-def _sha256_file(path: str, cancel_event: Optional[threading.Event] = None) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            if cancel_event and cancel_event.is_set():
-                raise RuntimeError("Build cancelled")
-            buf = f.read(COPY_BUF)
-            if not buf:
-                break
-            h.update(buf)
-    return h.hexdigest()
 
 
 def _run_zstd_compress(
@@ -236,64 +204,44 @@ def _run_zstd_decompress(
     return os.path.getsize(dst)
 
 
-def preview_scripts(cfg: BuildConfig) -> Dict[str, str]:
+def preview_update_binary(cfg: BuildConfig) -> str:
     zstd_bin = get_host_zstd()
     parts = cfg.partitions if cfg.partitions is not None else scan_partitions(cfg.imgs_dir, zstd_bin=zstd_bin)
     selected = [p for p in parts if p.selected]
 
     use_zstd = cfg.zstd_level > 0
     dyn_specs = [(p.name, p.raw_size) for p in selected if p.kind == "dynamic"]
-    dyn_names = [p.name for p in selected if p.kind == "dynamic"]
     boot_specs = [(p.name, p.raw_size) for p in selected if p.kind == "bootchain"]
-    boot_names = [p.name for p in selected if p.kind == "bootchain"]
     fw_specs = [(p.name, p.raw_size) for p in selected if p.kind in ("firmware", "bootloader")]
-    fw_names = [p.name for p in selected if p.kind in ("firmware", "bootloader")]
-    super_raw = any(p.kind == "super_raw" for p in selected)
+    super_parts = [p for p in selected if p.kind == "super_raw"]
+    super_raw = bool(super_parts)
+    super_raw_size = super_parts[0].raw_size if super_parts else 0
 
-    scripts = {
-        "META-INF/com/google/android/update-binary": generate_update_binary(
-            device=cfg.device,
-            version=cfg.version,
-            codename=cfg.codename,
-            maintainer=cfg.maintainer,
-            dynamic_specs=dyn_specs,
-            super_raw=super_raw,
-            bootchain_specs=boot_specs,
-            firmware_specs=fw_specs,
-            vbmeta_mode=cfg.vbmeta_mode,
-            use_zstd=use_zstd,
-            verify_sha256=cfg.verify_sha256,
-            clean_super=cfg.clean_super,
-        )
-    }
-    if cfg.include_fastboot:
-        fb_kwargs = dict(
-            device=cfg.device,
-            codename=cfg.codename,
-            firmware_imgs=fw_names,
-            bootchain_imgs=boot_names,
-            dynamic_imgs=dyn_names,
-            super_raw=super_raw,
-            use_zstd=use_zstd,
-        )
-        scripts["flash_windows.bat"] = generate_windows_fastboot(**fb_kwargs)
-        scripts["flash_linux.sh"] = generate_linux_fastboot(**fb_kwargs)
-        scripts["flash_macos.sh"] = generate_macos_fastboot(**fb_kwargs)
-        scripts["flash_termux.sh"] = generate_termux_fastboot(**fb_kwargs)
-    return scripts
+    return generate_update_binary(
+        device=cfg.device,
+        version=cfg.version,
+        codename=cfg.codename,
+        maintainer=cfg.maintainer,
+        dynamic_specs=dyn_specs,
+        super_raw=super_raw,
+        bootchain_specs=boot_specs,
+        firmware_specs=fw_specs,
+        vbmeta_mode=cfg.vbmeta_mode,
+        use_zstd=use_zstd,
+        clean_super=cfg.clean_super,
+        super_raw_size=super_raw_size,
+    )
 
 
 def _entry_pack_priority(rel_path: str, size: int) -> Tuple[int, int, str]:
-    """Pack META-INF, scripts, host tools, and small partitions first so they stay below 4 GiB offset."""
+    """Pack META-INF and small partitions first so they remain well below 4 GiB offset."""
     if rel_path.startswith("META-INF/"):
         return (0, size, rel_path)
-    if rel_path.startswith("flash_") or rel_path.startswith("bin/"):
-        return (1, size, rel_path)
-    return (2, size, rel_path)
+    return (1, size, rel_path)
 
 
 def _pack_zip(
-    work_dir: str,
+    file_entries: List[Tuple[str, str, bool]],
     output_zip: str,
     zip_level: int,
     on_progress: Optional[ProgressCallback],
@@ -305,46 +253,45 @@ def _pack_zip(
     if os.path.exists(output_zip):
         os.remove(output_zip)
 
-    exec_names = {
-        "update-binary", "zstd", "lptools", "avbctl", "fastboot",
-        "flash_linux.sh", "flash_macos.sh", "flash_termux.sh",
-    }
-
     entries: List[Tuple[str, str, int, bool]] = []
-    dir_entries: List[Tuple[str, str]] = []
+    dir_set: Set[str] = set()
     total_bytes = 0
 
-    for root, dirs, files in os.walk(work_dir):
-        dirs.sort()
-        files.sort()
-        for d in dirs:
-            dp = os.path.join(root, d)
-            rp = os.path.relpath(dp, work_dir).replace("\\", "/") + "/"
-            dir_entries.append((dp, rp))
-        for f in files:
-            fp = os.path.join(root, f)
-            rp = os.path.relpath(fp, work_dir).replace("\\", "/")
-            sz = os.path.getsize(fp)
-            is_exec = (
-                f in exec_names
-                or rp.startswith("META-INF/bin/")
-                or rp == "META-INF/zstd"
-                or rp.endswith(".sh")
-            )
-            entries.append((fp, rp, sz, is_exec))
-            total_bytes += sz
+    for fp, rp, is_exec in file_entries:
+        arc = rp.replace("\\", "/").lstrip("/")
+        sz = os.path.getsize(fp)
+        entries.append((fp, arc, sz, is_exec))
+        total_bytes += sz
+        parts = arc.split("/")[:-1]
+        cur = ""
+        for part in parts:
+            cur += part + "/"
+            dir_set.add(cur)
 
-    # Place metadata, helper binaries, scripts, and small images at low offsets before multi-GB payloads.
+    # Guard against out-of-space failure mid-pack when packing stored streams.
+    try:
+        free_bytes = shutil.disk_usage(out_dir or ".").free
+        needed_est = total_bytes + (4 * 1024 * 1024)
+        if zip_level <= 0 or all(rp.lower().endswith(ALREADY_COMPRESSED_EXTS) or rp.startswith("META-INF/") for _, rp, _, _ in entries):
+            if free_bytes < needed_est:
+                raise RuntimeError(
+                    f"Not enough free disk space in {out_dir or '.'}: "
+                    f"need {needed_est / 1048576:.1f} MB, have {free_bytes / 1048576:.1f} MB."
+                )
+    except OSError:
+        pass
+
     entries.sort(key=lambda item: _entry_pack_priority(item[1], item[2]))
+    now_dt = time.localtime()[:6]
 
     written_bytes = 0
+    pack_start = time.monotonic()
     default_comp = zipfile.ZIP_STORED if zip_level <= 0 else zipfile.ZIP_DEFLATED
     zip_kwargs = {"compresslevel": min(9, zip_level)} if zip_level > 0 else {}
 
     with zipfile.ZipFile(output_zip, "w", compression=default_comp, allowZip64=True, **zip_kwargs) as zf:
-        for dp, rp in dir_entries:
-            zinfo = zipfile.ZipInfo(filename=rp)
-            zinfo.date_time = time.localtime(os.stat(dp).st_mtime)[:6]
+        for dp in sorted(dir_set):
+            zinfo = zipfile.ZipInfo(filename=dp, date_time=now_dt)
             zinfo.create_system = 3
             zinfo.external_attr = 0o040755 << 16
             zf.writestr(zinfo, b"")
@@ -377,8 +324,10 @@ def _pack_zip(
                     dst_f.write(buf)
                     written_bytes += len(buf)
                     if on_progress and total_bytes > 0:
-                        pct = 75.0 + (24.0 * written_bytes / total_bytes)
-                        on_progress(min(99.0, pct), f"Packing {rp}")
+                        dt = max(0.05, time.monotonic() - pack_start)
+                        mbps = (written_bytes / 1048576.0) / dt
+                        pct = 68.0 + (31.0 * written_bytes / total_bytes)
+                        on_progress(min(99.0, pct), f"Packing {rp} ({mbps:.0f} MB/s)")
 
 
 def build_package(
@@ -410,6 +359,7 @@ def build_package(
 
     zstd_bin = get_host_zstd()
     use_zstd = cfg.zstd_level > 0
+    ext = ".img.zst" if use_zstd else ".img"
 
     progress(2.0, "Scanning partitions")
     all_parts = cfg.partitions if cfg.partitions is not None else scan_partitions(cfg.imgs_dir, zstd_bin=zstd_bin)
@@ -418,19 +368,18 @@ def build_package(
         raise ValueError("No partition images selected for packaging.")
 
     output_zip = sanitize_output_path(cfg.output_zip)
-    log(f"Target: {cfg.device} ({cfg.codename or 'universal'}) | Version: {cfg.version}")
+    log(f"Target: {cfg.device} ({cfg.codename or 'any'}) | Version: {cfg.version}")
     log(f"Selected {len(selected)} image(s) | ZSTD: {cfg.zstd_level} | ZIP: {cfg.zip_level}")
     if zstd_bin:
         log(f"zstd binary: {zstd_bin}")
     elif use_zstd or any(p.fmt == "zstd" for p in selected):
         log("Using Python zstandard fallback")
 
-    work_dir = tempfile.mkdtemp(prefix="newbies_flasher_work_")
     stage_dir = tempfile.mkdtemp(prefix="newbies_flasher_stage_")
     cancel_check = (lambda: bool(cancel_event and cancel_event.is_set()))
 
     try:
-        progress(8.0, "Preparing images")
+        progress(6.0, "Preparing images")
         prepared: Dict[str, Tuple[PartitionImage, str, str, int]] = {}
 
         for idx, p in enumerate(selected, 1):
@@ -460,27 +409,26 @@ def build_package(
                 log(f"  Keeping {p.name} flags at 0 (chained vbmeta)")
 
             prepared[p.name] = (p, eff_path, eff_fmt, eff_raw)
-            progress(8.0 + (12.0 * idx / len(selected)), f"Prepared {p.name}")
+            progress(6.0 + (10.0 * idx / len(selected)), f"Prepared {p.name}")
 
         compress_jobs = []
         decompress_jobs = []
         final_files: Dict[str, Tuple[PartitionImage, str, int]] = {}
 
+        # Stream already-ready images directly from source path without redundant temp copies.
         for name, (p, eff_path, eff_fmt, eff_raw) in prepared.items():
             if use_zstd:
-                dst = os.path.join(work_dir, f"{name}.img.zst")
                 if eff_fmt == "zstd":
-                    _fast_link_or_copy(eff_path, dst)
-                    final_files[name] = (p, dst, eff_raw)
+                    final_files[name] = (p, eff_path, eff_raw)
                 else:
+                    dst = os.path.join(stage_dir, f"{name}.img.zst")
                     compress_jobs.append((p, eff_path, dst, eff_raw))
             else:
-                dst = os.path.join(work_dir, f"{name}.img")
                 if eff_fmt == "zstd":
+                    dst = os.path.join(stage_dir, f"{name}.img")
                     decompress_jobs.append((p, eff_path, dst))
                 else:
-                    _fast_link_or_copy(eff_path, dst)
-                    final_files[name] = (p, dst, eff_raw)
+                    final_files[name] = (p, eff_path, eff_raw)
 
         total_cpus = os.cpu_count() or 4
 
@@ -505,7 +453,7 @@ def build_package(
                     ratio = (comp_sz / raw_sz * 100.0) if raw_sz else 0.0
                     log(f"  {p.name}: {raw_sz / 1048576:.1f} MB -> {comp_sz / 1048576:.1f} MB ({ratio:.0f}%)")
                     final_files[p.name] = (p, dst, raw_sz)
-                    progress(20.0 + (42.0 * done / len(compress_jobs)), f"Compressed {p.name} ({done}/{len(compress_jobs)})")
+                    progress(16.0 + (48.0 * done / len(compress_jobs)), f"Compressed {p.name} ({done}/{len(compress_jobs)})")
 
         if decompress_jobs:
             workers = min(len(decompress_jobs), total_cpus)
@@ -524,24 +472,11 @@ def build_package(
                     done += 1
                     log(f"  {p.name}: {raw_sz / 1048576:.1f} MB")
                     final_files[p.name] = (p, dst, raw_sz)
-                    progress(20.0 + (42.0 * done / len(decompress_jobs)), f"Decompressed {p.name} ({done}/{len(decompress_jobs)})")
+                    progress(16.0 + (48.0 * done / len(decompress_jobs)), f"Decompressed {p.name} ({done}/{len(decompress_jobs)})")
 
         check_cancel()
 
-        if cfg.verify_sha256:
-            progress(64.0, "Computing SHA-256 checksums")
-            log("Computing SHA-256 checksums...")
-            manifest_lines = []
-            for name in sorted(final_files):
-                _, fpath, _ = final_files[name]
-                digest = _sha256_file(fpath, cancel_event)
-                manifest_lines.append(f"{digest}  {os.path.basename(fpath)}")
-            meta_root = os.path.join(work_dir, "META-INF")
-            os.makedirs(meta_root, exist_ok=True)
-            with open(os.path.join(meta_root, "sha256sums.txt"), "w", encoding="utf-8", newline="\n") as mf:
-                mf.write("\n".join(manifest_lines) + "\n")
-
-        progress(70.0, "Generating recovery and fastboot scripts")
+        progress(65.0, "Writing recovery installer")
         dyn_specs: List[Tuple[str, int]] = []
         dyn_names: List[str] = []
         boot_specs: List[Tuple[str, int]] = []
@@ -550,14 +485,19 @@ def build_package(
         fw_names: List[str] = []
         bl_names: List[str] = []
         super_raw = False
+        super_raw_size = 0
+
+        zip_entries: List[Tuple[str, str, bool]] = []
 
         for p in selected:
-            _, _, exact_raw = final_files[p.name]
+            _, final_path, exact_raw = final_files[p.name]
+            zip_entries.append((final_path, f"{p.name}{ext}", False))
             if p.kind == "dynamic":
                 dyn_specs.append((p.name, exact_raw))
                 dyn_names.append(p.name)
             elif p.kind == "super_raw":
                 super_raw = True
+                super_raw_size = exact_raw
             elif p.kind == "bootchain":
                 boot_specs.append((p.name, exact_raw))
                 boot_names.append(p.name)
@@ -570,21 +510,11 @@ def build_package(
 
         dev_bins = get_device_binaries()
         if use_zstd and "zstd-arm64" in dev_bins:
-            os.makedirs(os.path.join(work_dir, "META-INF"), exist_ok=True)
-            _fast_link_or_copy(str(dev_bins["zstd-arm64"]), os.path.join(work_dir, "META-INF", "zstd"))
-
+            zip_entries.append((str(dev_bins["zstd-arm64"]), "META-INF/zstd", True))
         if dyn_specs and "lptools" in dev_bins:
-            bin_dst = os.path.join(work_dir, "META-INF", "bin")
-            os.makedirs(bin_dst, exist_ok=True)
-            _fast_link_or_copy(str(dev_bins["lptools"]), os.path.join(bin_dst, "lptools"))
-
+            zip_entries.append((str(dev_bins["lptools"]), "META-INF/bin/lptools", True))
         if cfg.vbmeta_mode in ("disable", "enable") and "avbctl" in dev_bins:
-            bin_dst = os.path.join(work_dir, "META-INF", "bin")
-            os.makedirs(bin_dst, exist_ok=True)
-            _fast_link_or_copy(str(dev_bins["avbctl"]), os.path.join(bin_dst, "avbctl"))
-
-        meta_android = os.path.join(work_dir, "META-INF", "com", "google", "android")
-        os.makedirs(meta_android, exist_ok=True)
+            zip_entries.append((str(dev_bins["avbctl"]), "META-INF/bin/avbctl", True))
 
         update_bin_text = generate_update_binary(
             device=cfg.device,
@@ -597,49 +527,22 @@ def build_package(
             firmware_specs=fw_specs,
             vbmeta_mode=cfg.vbmeta_mode,
             use_zstd=use_zstd,
-            verify_sha256=cfg.verify_sha256,
             clean_super=cfg.clean_super,
+            super_raw_size=super_raw_size,
         )
-        ub_path = os.path.join(meta_android, "update-binary")
+        ub_path = os.path.join(stage_dir, "update-binary")
+        us_path = os.path.join(stage_dir, "updater-script")
         with open(ub_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(update_bin_text)
-        with open(os.path.join(meta_android, "updater-script"), "w", encoding="utf-8", newline="\n") as f:
+        with open(us_path, "w", encoding="utf-8", newline="\n") as f:
             f.write("# Newbies Flasher\n")
 
-        if cfg.include_fastboot:
-            fb_assets = get_fastboot_bundle_assets()
-            if fb_assets["windows"]:
-                wt = os.path.join(work_dir, "bin", "windows")
-                os.makedirs(wt, exist_ok=True)
-                for asset in fb_assets["windows"]:
-                    _fast_link_or_copy(str(asset), os.path.join(wt, asset.name))
-            if fb_assets["linux"]:
-                lt = os.path.join(work_dir, "bin", "linux")
-                os.makedirs(lt, exist_ok=True)
-                for asset in fb_assets["linux"]:
-                    _fast_link_or_copy(str(asset), os.path.join(lt, asset.name))
+        zip_entries.append((ub_path, "META-INF/com/google/android/update-binary", True))
+        zip_entries.append((us_path, "META-INF/com/google/android/updater-script", False))
 
-            fb_kwargs = dict(
-                device=cfg.device,
-                codename=cfg.codename,
-                firmware_imgs=fw_names + bl_names,
-                bootchain_imgs=boot_names,
-                dynamic_imgs=dyn_names,
-                super_raw=super_raw,
-                use_zstd=use_zstd,
-            )
-            with open(os.path.join(work_dir, "flash_windows.bat"), "w", encoding="utf-8", newline="\r\n") as f:
-                f.write(generate_windows_fastboot(**fb_kwargs))
-            with open(os.path.join(work_dir, "flash_linux.sh"), "w", encoding="utf-8", newline="\n") as f:
-                f.write(generate_linux_fastboot(**fb_kwargs))
-            with open(os.path.join(work_dir, "flash_macos.sh"), "w", encoding="utf-8", newline="\n") as f:
-                f.write(generate_macos_fastboot(**fb_kwargs))
-            with open(os.path.join(work_dir, "flash_termux.sh"), "w", encoding="utf-8", newline="\n") as f:
-                f.write(generate_termux_fastboot(**fb_kwargs))
-
-        progress(75.0, "Packing ZIP archive")
+        progress(68.0, "Packing ZIP archive")
         log(f"Packing {os.path.basename(output_zip)}...")
-        _pack_zip(work_dir, output_zip, cfg.zip_level, on_progress=on_progress, cancel_event=cancel_event)
+        _pack_zip(zip_entries, output_zip, cfg.zip_level, on_progress=on_progress, cancel_event=cancel_event)
 
         elapsed = time.monotonic() - start_ts
         final_size = os.path.getsize(output_zip)
@@ -671,5 +574,4 @@ def build_package(
                 pass
         raise
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(stage_dir, ignore_errors=True)

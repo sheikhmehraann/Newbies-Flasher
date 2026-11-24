@@ -17,20 +17,46 @@ def generate_update_binary(
     firmware_specs: List[Tuple[str, int]],
     vbmeta_mode: str = "skip",
     use_zstd: bool = True,
-    verify_sha256: bool = True,
     clean_super: bool = True,
+    super_raw_size: int = 0,
 ) -> str:
     ext = ".img.zst" if use_zstd else ".img"
     dev_q = _q(device)
     ver_q = _q(version)
     code_q = _q(codename)
+    code_display_q = _q(codename if codename else "(any)")
     maint_q = _q(maintainer)
+
+    super_weight = super_raw_size if (super_raw and super_raw_size > 0) else (1 if super_raw else 0)
     total_dyn_bytes = sum(sz for _, sz in dynamic_specs)
+    total_flash_bytes = (
+        total_dyn_bytes
+        + sum(sz for _, sz in bootchain_specs)
+        + sum(sz for _, sz in firmware_specs)
+        + super_weight
+    )
+    if total_flash_bytes <= 0:
+        total_flash_bytes = 1
+
+    has_super_stage = bool(super_raw or dynamic_specs)
+    has_boot_stage = bool(bootchain_specs or vbmeta_mode in ("disable", "enable"))
+    has_fw_stage = bool(firmware_specs)
+    total_stages = 1 + int(has_super_stage) + int(has_boot_stage) + int(has_fw_stage)
+    stage_idx = 1
+
+    done_bytes = 0
+
+    def next_progress(added_bytes: int) -> str:
+        nonlocal done_bytes
+        done_bytes += max(0, added_bytes)
+        frac = 0.12 + (0.86 * min(1.0, done_bytes / total_flash_bytes))
+        return f"{frac:.3f}"
 
     lines: List[str] = [
         "#!/sbin/sh",
         'OUTFD="/proc/self/fd/$2"',
         'ZIPFILE="$3"',
+        "START_TS=$(date +%s 2>/dev/null || echo 0)",
         "",
         "ui_print() {",
         '    printf \'ui_print %s\\nui_print\\n\' "$1" >>"$OUTFD"',
@@ -53,7 +79,7 @@ def generate_update_binary(
         'AVB_BIN=""',
         "",
         "cleanup() {",
-        "    rm -f /tmp/nf_unzip_rc /tmp/nf_err.log /tmp/nf_sha256sums.txt 2>/dev/null || true",
+        "    rm -f /tmp/nf_unzip_rc /tmp/nf_err.log 2>/dev/null || true",
         "}",
         "trap cleanup EXIT",
         "",
@@ -81,7 +107,7 @@ def generate_update_binary(
         "    command -v blockdev >/dev/null 2>&1 || return 0",
         '    cap=$(blockdev --getsize64 "$dest" 2>/dev/null || echo 0)',
         '    if [ -n "$cap" ] && [ "$cap" -gt 0 ] 2>/dev/null && [ "$need" -gt "$cap" ]; then',
-        '        abort "$label image ($need bytes) is larger than target partition ($cap bytes)"',
+        '        abort "$label image ($need bytes) exceeds target partition ($cap bytes)"',
         "    fi",
         "}",
         "",
@@ -137,20 +163,20 @@ def generate_update_binary(
         "    u_rc=$(cat /tmp/nf_unzip_rc 2>/dev/null || echo 1)",
         '    if [ "$u_rc" -ne 0 ]; then',
         "        print_err_tail",
-        '        abort "ZIP extraction failed for $src (exit $u_rc). Re-download archive or check storage."',
+        '        abort "ZIP extraction failed for $src (exit $u_rc). Re-download ZIP or check storage."',
         "    fi",
         '    if [ "$z_rc" -ne 0 ]; then',
         "        print_err_tail",
-        '        abort "ZSTD decode or write failed for $src -> $dest (exit $z_rc)"',
+        '        abort "ZSTD decode/write failed for $src -> $dest (exit $z_rc). Archive may be corrupt."',
         "    fi",
         "}",
         "",
         "flash_partition_auto() {",
-        '    src="$1"; part="$2"; raw_sz="$3"; compressed="$4"',
+        '    src="$1"; part="$2"; raw_sz="$3"; compressed="$4"; tag="$5"',
         '    dev_a=$(find_block_device "${part}_a" || true)',
         '    dev_b=$(find_block_device "${part}_b" || true)',
         '    if [ -n "$dev_a" ] || [ -n "$dev_b" ]; then',
-        '        ui_print "  [OK] Flashing $part (slot A + B)"',
+        '        ui_print "  $tag $part (slot A + B)"',
         '        if [ -n "$dev_a" ]; then',
         '            if [ "$compressed" = "1" ]; then flash_zstd_to_dev "$src" "$dev_a" "$raw_sz" "${part}_a"; else flash_raw_to_dev "$src" "$dev_a" "$raw_sz" "${part}_a"; fi',
         "        fi",
@@ -160,29 +186,9 @@ def generate_update_binary(
         "    else",
         '        dev_single=$(find_block_device "$part" || true)',
         '        [ -n "$dev_single" ] || abort "Block device not found for partition: $part"',
-        '        ui_print "  [OK] Flashing $part"',
+        '        ui_print "  $tag $part"',
         '        if [ "$compressed" = "1" ]; then flash_zstd_to_dev "$src" "$dev_single" "$raw_sz" "$part"; else flash_raw_to_dev "$src" "$dev_single" "$raw_sz" "$part"; fi',
         "    fi",
-        "}",
-        "",
-        "verify_manifest() {",
-        "    if ! command -v sha256sum >/dev/null 2>&1; then",
-        '        ui_print "  - sha256sum unavailable in recovery, skipping hash check"',
-        "        return 0",
-        "    fi",
-        '    unzip -p "$ZIPFILE" "META-INF/sha256sums.txt" >/tmp/nf_sha256sums.txt 2>/dev/null || return 0',
-        '    ui_print "- Verifying package checksums..."',
-        "    checked=0",
-        "    while IFS= read -r line; do",
-        '        [ -n "$line" ] || continue',
-        '        expected=$(printf \'%s\' "$line" | awk \'{print $1}\')',
-        '        entry=$(printf \'%s\' "$line" | awk \'{print $2}\')',
-        '        [ -n "$expected" ] && [ -n "$entry" ] || continue',
-        '        actual=$(unzip -p "$ZIPFILE" "$entry" | sha256sum | awk \'{print $1}\')',
-        '        [ "$actual" = "$expected" ] || abort "Corrupt archive: SHA-256 mismatch on $entry"',
-        "        checked=$((checked + 1))",
-        "    done </tmp/nf_sha256sums.txt",
-        '    ui_print "  -> Verified $checked file(s)"',
         "}",
         "",
         "get_volume_key() {",
@@ -196,24 +202,39 @@ def generate_update_binary(
         "}",
         "",
         "check_device() {",
-        f"    expected={code_q}",
-        '    [ -n "$expected" ] || return 0',
+        f"    expected_list={code_q}",
+        '    [ -n "$expected_list" ] || return 0',
         "    actual=$(getprop ro.product.device)",
         '    [ -n "$actual" ] || actual=$(getprop ro.build.product)',
+        '    [ -n "$actual" ] || actual=$(getprop ro.product.vendor.device)',
+        '    [ -n "$actual" ] || actual=$(getprop ro.product.system.device)',
         '    [ -n "$actual" ] || actual=$(getprop ro.product.name)',
         '    [ -n "$actual" ] || return 0',
         "    actual_lc=$(printf '%s' \"$actual\" | tr 'A-Z' 'a-z')",
-        "    expected_lc=$(printf '%s' \"$expected\" | tr 'A-Z' 'a-z')",
-        '    if [ "$actual_lc" != "$expected_lc" ]; then',
-        '        ui_print "- Device mismatch: phone is $actual, package is for $expected"',
-        '        if ! get_volume_key; then abort "Cancelled due to device mismatch"; fi',
+        "    matched=0",
+        "    old_ifs=$IFS",
+        "    IFS=','",
+        "    for item in $expected_list; do",
+        "        cand=$(printf '%s' \"$item\" | tr -d ' ' | tr 'A-Z' 'a-z')",
+        '        [ -n "$cand" ] || continue',
+        "        # Accept exact match or OEM prefix like Infinix-X6871 matching X6871.",
+        '        case "$actual_lc" in',
+        '            "$cand"|*-"$cand"|*_"$cand") matched=1; break ;;',
+        "        esac",
+        '        case "$cand" in',
+        '            *-"$actual_lc"|*_"$actual_lc") matched=1; break ;;',
+        "        esac",
+        "    done",
+        "    IFS=$old_ifs",
+        '    if [ "$matched" -eq 1 ]; then',
+        '        ui_print "- Device : $actual (verified)"',
         "    else",
-        '        ui_print "- Device verified : $actual"',
+        '        ui_print "- Device mismatch: phone is $actual, package expects $expected_list"',
+        '        if ! get_volume_key; then abort "Cancelled due to device mismatch"; fi',
         "    fi",
         "}",
         "",
         "unmount_dynamic() {",
-        "    # Unmount any live mountpoints backed by dm/mapper devices first (fixes Unable to unmap).",
         "    if [ -r /proc/mounts ]; then",
         "        dm_mounts=$(awk '$1 ~ /^\\/dev\\/block\\/(mapper|dm-)/ {print $2}' /proc/mounts 2>/dev/null | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}')",
         "        for mnt in $dm_mounts; do",
@@ -241,7 +262,7 @@ def generate_update_binary(
         "    else",
         '        IS_AB=0; SLOT=""; OTHER_SLOT=""; SLOT_LABEL="A-Only"',
         "    fi",
-        '    ui_print "- Active slot     : $SLOT_LABEL"',
+        '    ui_print "- Slot   : $SLOT_LABEL"',
         "}",
         "",
         "lp_clear_one() {",
@@ -257,16 +278,33 @@ def generate_update_binary(
         "    fi",
         "}",
         "",
+        "lp_is_protected() {",
+        '    case "$1" in',
+        "        control|by-uuid|userdata|metadata|cache|persist|misc|frp|nvdata|nvram|protect*|proinfo|seccfg|*-verity*) return 0 ;;",
+        "    esac",
+        "    return 1",
+        "}",
+        "",
         "lp_clear_all_stale() {",
+        "    if command -v lpdump >/dev/null 2>&1; then",
+        "        lp_names=$(lpdump 2>/dev/null | awk '/^Partition table:/{p=1;next} /^[A-Z]/{p=0} p && /^  Name:/{print $2}')",
+        "        for nm in $lp_names; do",
+        '            lp_is_protected "$nm" && continue',
+        '            "$LPTOOLS" unmap "$nm" >/dev/null 2>&1 || true',
+        '            "$LPTOOLS" remove "$nm" >/dev/null 2>&1 || true',
+        "        done",
+        "    fi",
         "    if [ -d /dev/block/mapper ]; then",
         "        for node in /dev/block/mapper/*; do",
         '            [ -e "$node" ] || continue',
         '            nm=$(basename "$node")',
-        '            case "$nm" in',
-        "                control|by-uuid|userdata|metadata|cache|persist|misc|frp|nvdata|nvram|protect*|proinfo|seccfg|*-verity*) continue ;;",
-        "            esac",
+        '            lp_is_protected "$nm" && continue',
         '            "$LPTOOLS" unmap "$nm" >/dev/null 2>&1 || true',
         '            "$LPTOOLS" remove "$nm" >/dev/null 2>&1 || true',
+        '            case "$nm" in',
+        '                *_a) other="${nm%_a}_b"; "$LPTOOLS" unmap "$other" >/dev/null 2>&1 || true; "$LPTOOLS" remove "$other" >/dev/null 2>&1 || true ;;',
+        '                *_b) other="${nm%_b}_a"; "$LPTOOLS" unmap "$other" >/dev/null 2>&1 || true; "$LPTOOLS" remove "$other" >/dev/null 2>&1 || true ;;',
+        "            esac",
         "        done",
         "    fi",
         "}",
@@ -301,7 +339,6 @@ def generate_update_binary(
 
     if dynamic_specs:
         lines.extend([
-            "    # Prefer recovery's native lptools first (matches Android 14-16 liblp/AIDL), fallback to bundled.",
             "    for cand in /system/bin/lptools /sbin/lptools /vendor/bin/lptools; do",
             '        if [ -x "$cand" ] && "$cand" free >/dev/null 2>&1; then',
             '            LPTOOLS="$cand"',
@@ -342,78 +379,81 @@ def generate_update_binary(
         'ui_print "             Newbies Flasher"',
         'ui_print "=========================================="',
         f'ui_print "Device     : "{dev_q}',
-        f'ui_print "Codename   : "{code_q}',
+        f'ui_print "Codename   : "{code_display_q}',
         f'ui_print "Version    : "{ver_q}',
         f'ui_print "Maintainer : "{maint_q}',
         'ui_print "=========================================="',
         'ui_print " "',
-        "set_progress 0.05",
+        "set_progress 0.04",
         "",
-        "ui_print \"[1/4] Pre-flight checks\"",
-        'if [ ! -f "$ZIPFILE" ]; then abort "ZIP archive path is not readable: $ZIPFILE"; fi',
+        f'ui_print "[{stage_idx}/{total_stages}] Preparing"',
+        'if [ ! -f "$ZIPFILE" ]; then abort "ZIP archive is not readable: $ZIPFILE"; fi',
         "check_device",
         "detect_slot",
         "resolve_helpers",
-    ])
-
-    if verify_sha256:
-        lines.append("verify_manifest")
-
-    lines.extend([
         "unmount_dynamic",
-        "set_progress 0.15",
+        "set_progress 0.12",
         'ui_print " "',
     ])
 
     comp_flag = "1" if use_zstd else "0"
 
-    # Stage 2: Super / dynamic partitions FIRST (before touching bootchain or firmware).
-    if super_raw or dynamic_specs:
-        lines.append('ui_print "[2/4] Dynamic / Super partitions"')
+    if has_super_stage:
+        stage_idx += 1
+        lines.append(f'ui_print "[{stage_idx}/{total_stages}] Dynamic / Super partitions"')
         if super_raw:
-            lines.append(f"flash_partition_auto {_q('super' + ext)} 'super' 0 {comp_flag}")
+            lines.append(f"flash_partition_auto {_q('super' + ext)} 'super' {super_raw_size} {comp_flag} '[1/1]'")
+            lines.append(f"set_progress {next_progress(super_weight)}")
         if dynamic_specs:
-            lines.append('"$LPTOOLS" clear-cow >/dev/null 2>&1 || true')
+            lines.extend([
+                'super_dev=$(find_block_device "super" || true)',
+                '[ -n "$super_dev" ] || abort "Device does not have a super partition"',
+                '"$LPTOOLS" clear-cow >/dev/null 2>&1 || true',
+            ])
             if clean_super:
                 lines.append("lp_clear_all_stale")
             for part, _ in dynamic_specs:
                 lines.append(f"lp_clear_one {_q(part)}")
-            # Lift group maximum_size cap (prevents ENOSPC when flashing larger/different ROM layouts).
             lines.append('"$LPTOOLS" unlimited-group >/dev/null 2>&1 || true')
             lines.extend([
                 f"REQ_SUPER_BYTES={total_dyn_bytes}",
-                'FREE_BYTES=$("$LPTOOLS" free 2>/dev/null | awk \'/Free space:/ {print $3; exit}\')',
+                'FREE_BYTES=$("$LPTOOLS" free 2>&1 | awk \'/Free space:/ {print $3; exit}\')',
                 'if [ -n "$FREE_BYTES" ] && [ "$FREE_BYTES" -gt 0 ] 2>/dev/null; then',
-                '    ui_print "  -> Super free: $((FREE_BYTES / 1048576)) MB | Required: $((REQ_SUPER_BYTES / 1048576)) MB"',
+                '    ui_print "- Super  : $((FREE_BYTES / 1048576)) MB free / $((REQ_SUPER_BYTES / 1048576)) MB needed"',
                 '    if [ "$FREE_BYTES" -lt "$REQ_SUPER_BYTES" ]; then',
-                '        abort "Not enough space in super (need $((REQ_SUPER_BYTES / 1048576)) MB, have $((FREE_BYTES / 1048576)) MB). Flash stock super.img or free space first."',
+                '        abort "Not enough space in super (need $((REQ_SUPER_BYTES / 1048576)) MB, have $((FREE_BYTES / 1048576)) MB). Flash stock super.img first."',
                 "    fi",
                 "fi",
             ])
             for part, raw_sz in dynamic_specs:
                 lines.append(f"lp_create_slot {_q(part)} {raw_sz}")
-            lines.append("set_progress 0.25")
-            for part, raw_sz in dynamic_specs:
+            dyn_total = len(dynamic_specs)
+            for idx, (part, raw_sz) in enumerate(dynamic_specs, 1):
+                part_q = _q(part)
                 src_q = _q(part + ext)
                 mb = max(1, raw_sz // 1048576)
-                lines.append(f'target_dev=$(find_mapper_device "{part}${{SLOT}}") || abort "Mapper device missing for {part}${{SLOT}}"')
-                lines.append(f'ui_print "  [OK] Flashing {part}${{SLOT}} ({mb} MB)"')
+                lines.append(f'part_slot={part_q}"$SLOT"')
+                lines.append('target_dev=$(find_mapper_device "$part_slot") || abort "Mapper device missing for $part_slot"')
+                lines.append(f'ui_print "  [{idx}/{dyn_total}] $part_slot ({mb} MB)"')
                 if use_zstd:
-                    lines.append(f'flash_zstd_to_dev {src_q} "$target_dev" {raw_sz} "{part}${{SLOT}}"')
+                    lines.append(f'flash_zstd_to_dev {src_q} "$target_dev" {raw_sz} "$part_slot"')
                 else:
-                    lines.append(f'flash_raw_to_dev {src_q} "$target_dev" {raw_sz} "{part}${{SLOT}}"')
+                    lines.append(f'flash_raw_to_dev {src_q} "$target_dev" {raw_sz} "$part_slot"')
+                lines.append(f"set_progress {next_progress(raw_sz)}")
             lines.append("sync")
             for part, _ in dynamic_specs:
-                lines.append(f'"$LPTOOLS" unmap "{part}${{SLOT}}" >/dev/null 2>&1 || true')
-                lines.append(f'"$LPTOOLS" map "{part}${{SLOT}}" >/dev/null 2>&1 || true')
-        lines.append("set_progress 0.70")
+                part_q = _q(part)
+                lines.append(f'"$LPTOOLS" unmap {part_q}"$SLOT" >/dev/null 2>&1 || true')
+                lines.append(f'"$LPTOOLS" map {part_q}"$SLOT" >/dev/null 2>&1 || true')
         lines.append('ui_print " "')
 
-    # Stage 3: Bootchain & AVB 2.0
-    if bootchain_specs or vbmeta_mode in ("disable", "enable"):
-        lines.append('ui_print "[3/4] Bootchain & AVB 2.0"')
-        for part, raw_sz in bootchain_specs:
-            lines.append(f"flash_partition_auto {_q(part + ext)} {_q(part)} {raw_sz} {comp_flag}")
+    if has_boot_stage:
+        stage_idx += 1
+        lines.append(f'ui_print "[{stage_idx}/{total_stages}] Bootchain & AVB 2.0"')
+        boot_total = len(bootchain_specs)
+        for idx, (part, raw_sz) in enumerate(bootchain_specs, 1):
+            lines.append(f"flash_partition_auto {_q(part + ext)} {_q(part)} {raw_sz} {comp_flag} '[{idx}/{boot_total}]'")
+            lines.append(f"set_progress {next_progress(raw_sz)}")
 
         if vbmeta_mode in ("disable", "enable"):
             action = "disable" if vbmeta_mode == "disable" else "enable"
@@ -423,34 +463,44 @@ def generate_update_binary(
                 '    V_STATE=$("$AVB_BIN" get-verity 2>/dev/null || true)',
                 '    F_STATE=$("$AVB_BIN" get-verification 2>/dev/null || true)',
                 f'    if printf \'%s\' "$V_STATE" | grep -qi "{state_word}" && printf \'%s\' "$F_STATE" | grep -qi "{state_word}"; then',
-                f'        ui_print "  -> AVB 2.0 already {state_word}"',
+                f'        ui_print "  - AVB 2.0 : already {state_word}"',
                 "    else",
                 f'        "$AVB_BIN" --force {action}-verity >/dev/null 2>&1 || true',
                 f'        "$AVB_BIN" --force {action}-verification >/dev/null 2>&1 || true',
-                f'        ui_print "  -> AVB 2.0 set to {state_word}"',
+                f'        ui_print "  - AVB 2.0 : {state_word}"',
                 "    fi",
                 "else",
-                '    ui_print "  - avbctl unavailable in recovery; relying on packaged vbmeta"',
+                '    ui_print "  - AVB 2.0 : avbctl unavailable, using packaged vbmeta"',
                 "fi",
             ])
-        lines.append("set_progress 0.85")
         lines.append('ui_print " "')
 
-    # Stage 4: Firmware & Bootloader (last, only after super & bootchain succeeded)
-    if firmware_specs:
-        lines.append('ui_print "[4/4] Firmware partitions"')
-        for fw, raw_sz in firmware_specs:
-            lines.append(f"flash_partition_auto {_q(fw + ext)} {_q(fw)} {raw_sz} {comp_flag}")
+    if has_fw_stage:
+        stage_idx += 1
+        lines.append(f'ui_print "[{stage_idx}/{total_stages}] Firmware partitions"')
+        fw_total = len(firmware_specs)
+        for idx, (fw, raw_sz) in enumerate(firmware_specs, 1):
+            lines.append(f"flash_partition_auto {_q(fw + ext)} {_q(fw)} {raw_sz} {comp_flag} '[{idx}/{fw_total}]'")
+            lines.append(f"set_progress {next_progress(raw_sz)}")
         lines.append('ui_print " "')
 
     lines.extend([
         "sync",
         "set_progress 1.0",
+        "END_TS=$(date +%s 2>/dev/null || echo 0)",
+        'ELAPSED=""',
+        'if [ "$START_TS" -gt 0 ] 2>/dev/null && [ "$END_TS" -ge "$START_TS" ] 2>/dev/null; then',
+        "    DIFF=$((END_TS - START_TS))",
+        '    if [ "$DIFF" -ge 60 ]; then',
+        '        ELAPSED=" ($((DIFF / 60))m $((DIFF % 60))s)"',
+        "    else",
+        '        ELAPSED=" (${DIFF}s)"',
+        "    fi",
+        "fi",
         'ui_print "=========================================="',
-        'ui_print "         Installation Complete"',
+        'ui_print "Installation complete${ELAPSED}"',
+        'ui_print "Format Data if switching ROMs or Android versions."',
         'ui_print "=========================================="',
-        'ui_print "Note: If switching ROMs or Android versions,"',
-        'ui_print "format Data in recovery before rebooting."',
         "exit 0",
         "",
     ])

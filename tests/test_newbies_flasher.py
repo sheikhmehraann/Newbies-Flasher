@@ -24,7 +24,7 @@ from flasher.builder import (
     BuildConfig,
     build_package,
     format_output_filename,
-    preview_scripts,
+    preview_update_binary,
 )
 from flasher.partitions import (
     classify_partition,
@@ -153,7 +153,7 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertEqual(props["codename"], "testphone")
         self.assertEqual(props["version"], "2.5.0")
 
-    def test_full_build_hardening_zip_order_and_chained_vbmeta(self) -> None:
+    def test_full_build_recovery_only_no_fastboot_no_sha256_and_zip_order(self) -> None:
         sp_vendor = os.path.join(self.imgs, "vendor.img")
         expected_vendor = _make_sparse_test_image(sp_vendor)
 
@@ -162,15 +162,13 @@ class TestNewbiesFlasher(unittest.TestCase):
         cfg = BuildConfig(
             imgs_dir=self.imgs,
             output_zip=out_zip,
-            device="Test Phone",
-            codename="testphone",
+            device="Infinix GT 20 Pro",
+            codename="X6871",
             version="2.5.0",
             maintainer="dev",
             vbmeta_mode="disable",
             zstd_level=1,
             zip_level=5,
-            include_fastboot=True,
-            verify_sha256=True,
             clean_super=True,
             partitions=parts,
         )
@@ -188,10 +186,23 @@ class TestNewbiesFlasher(unittest.TestCase):
             names_list = zf.namelist()
             names = set(names_list)
             self.assertIn("META-INF/com/google/android/update-binary", names)
-            self.assertIn("META-INF/sha256sums.txt", names)
-            self.assertNotIn("META-INF/bin/rapidflasher-arm64", names)
-            self.assertNotIn("META-INF/bin/lpdump", names)
-            self.assertNotIn("META-INF/bin/lpmake", names)
+            self.assertIn("META-INF/com/google/android/updater-script", names)
+
+            # Fastboot scripts, host fastboot binaries, and SHA-256 manifest must not exist
+            for forbidden in (
+                "META-INF/sha256sums.txt",
+                "flash_windows.bat",
+                "flash_linux.sh",
+                "flash_macos.sh",
+                "flash_termux.sh",
+                "bin/windows/fastboot.exe",
+                "bin/linux/fastboot",
+                "META-INF/bin/rapidflasher-arm64",
+                "META-INF/bin/lpdump",
+                "META-INF/bin/lpmake",
+            ):
+                self.assertNotIn(forbidden, names)
+            self.assertFalse(any(n.startswith("bin/") for n in names))
 
             # META-INF entries must be packed before payload images
             ub_idx = names_list.index("META-INF/com/google/android/update-binary")
@@ -207,10 +218,15 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertIn(f"lp_create_slot vendor {len(expected_vendor)}", ub)
             self.assertIn("unlimited-group", ub)
             self.assertIn("lp_clear_all_stale", ub)
+            self.assertIn("lpdump", ub)
             self.assertIn("/proc/mounts", ub)
             self.assertIn("unlock_block_rw", ub)
             self.assertIn("check_block_fits", ub)
+            self.assertIn("END_TS=$(date +%s", ub)
+            self.assertIn("Installation complete${ELAPSED}", ub)
             self.assertNotIn("--no-check", ub)
+            self.assertNotIn("sha256sums.txt", ub)
+            self.assertNotIn("verify_manifest", ub)
 
             # Dynamic / super stage must execute BEFORE bootchain and firmware
             self.assertLess(ub.index("[2/4] Dynamic / Super partitions"), ub.index("[3/4] Bootchain & AVB 2.0"))
@@ -231,7 +247,26 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertEqual(read_vbmeta_flags(vb_raw), 3)
             self.assertEqual(read_vbmeta_flags(vbs_raw), 0)
 
-    def test_adversarial_metadata_and_parentheses_zip_name(self) -> None:
+    def test_zero_copy_repack_of_precompressed_zst(self) -> None:
+        zst_dir = os.path.join(self.tmp, "zst_imgs")
+        os.makedirs(zst_dir)
+        raw_boot = os.path.join(self.tmp, "boot_src.img")
+        zst_boot = os.path.join(zst_dir, "boot.img.zst")
+        with open(raw_boot, "wb") as f:
+            f.write(b"BOOTIMG_PAYLOAD" * 512)
+        zbin = get_host_zstd()
+        subprocess.run([zbin, "-1", "-f", "-q", raw_boot, "-o", zst_boot], check=True)
+
+        out_zip = os.path.join(self.tmp, "repacked.zip")
+        cfg = BuildConfig(imgs_dir=zst_dir, output_zip=out_zip, zstd_level=1, zip_level=1)
+        res = build_package(cfg)
+        self.assertTrue(os.path.isfile(res.output_zip))
+        with zipfile.ZipFile(res.output_zip, "r") as zf:
+            self.assertIn("boot.img.zst", zf.namelist())
+            with open(zst_boot, "rb") as f:
+                self.assertEqual(zf.read("boot.img.zst"), f.read())
+
+    def test_adversarial_metadata_and_empty_codename(self) -> None:
         cfg = BuildConfig(
             imgs_dir=self.imgs,
             output_zip=os.path.join(self.tmp, "adv.zip"),
@@ -240,13 +275,13 @@ class TestNewbiesFlasher(unittest.TestCase):
             version="1.0`uname`",
             maintainer="dev|evil",
         )
-        scripts = preview_scripts(cfg)
-        ub = scripts["META-INF/com/google/android/update-binary"]
-        bat = scripts["flash_windows.bat"]
-        self.assertIn("expected='code;rm -rf / & whoami'", ub)
-        self.assertNotIn("& calc", bat)
-        self.assertIn("if errorlevel 1", bat)
-        self.assertIn("resize-logical-partition", bat)
+        ub = preview_update_binary(cfg)
+        self.assertIn("expected_list='code;rm -rf / & whoami'", ub)
+
+        cfg_any = BuildConfig(imgs_dir=self.imgs, output_zip=os.path.join(self.tmp, "any.zip"), codename="")
+        ub_any = preview_update_binary(cfg_any)
+        self.assertIn("expected_list=''", ub_any)
+        self.assertIn("'(any)'", ub_any)
 
     def test_build_cancellation_cleans_output(self) -> None:
         ev = threading.Event()
@@ -267,7 +302,7 @@ class TestNewbiesFlasher(unittest.TestCase):
             "X6871-1.0-Flashable.zip",
         )
 
-    def test_gui_fits_768p_screen_and_safe_select(self) -> None:
+    def test_gui_defaults_live_preview_fits_768p_and_safe_select(self) -> None:
         import tkinter as tk
         from gui import NewbiesFlasherApp
 
@@ -278,6 +313,15 @@ class TestNewbiesFlasher(unittest.TestCase):
         root.withdraw()
         try:
             app = NewbiesFlasherApp(root)
+            self.assertEqual(app.device_var.get(), "Infinix GT 20 Pro")
+            self.assertEqual(app.codename_var.get(), "X6871")
+            self.assertFalse(hasattr(app, "fastboot_var"))
+            self.assertFalse(hasattr(app, "sha256_var"))
+            self.assertEqual(app.out_name_lbl.cget("text"), "Infinix-GT-20-Pro-X6871-1.0-Flashable.zip")
+
+            app.version_var.set("15.1.2")
+            self.assertEqual(app.out_name_lbl.cget("text"), "Infinix-GT-20-Pro-X6871-15.1.2-Flashable.zip")
+
             app.partitions = scan_partitions(self.imgs)
             app._refresh_tree()
             root.update_idletasks()

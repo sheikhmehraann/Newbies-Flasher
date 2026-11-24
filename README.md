@@ -1,23 +1,26 @@
 # Newbies Flasher
 
-A fast, simple Android flashable package maker that turns raw, sparse, or Zstandard-compressed partition images into a single ZIP you can flash from custom recovery or Fastboot on Windows, Linux, macOS, and Termux.
+A fast, simple Android recovery flashable ZIP maker. It packages raw, sparse, or Zstandard-compressed partition images into a recovery-flashable ZIP on Windows, Linux, macOS, and Android Termux.
 
 Requires Python 3.8 or newer. No external Python packages are needed.
 
 ## What It Does
 
-- Packages `.img`, sparse `.img`, and `.img.zst` files into a hybrid Recovery + Fastboot ZIP.
-- Automatically detects Android sparse images and unsparses them before packing so recovery flashes clean raw images.
+- Packages `.img`, Android sparse `.img`, and `.img.zst` files into a clean recovery flashable ZIP (`META-INF/com/google/android/update-binary`).
+- Automatically detects Android sparse images and unsparses them before packing so custom recovery writes clean raw images.
 - Reads Zstandard uncompressed partition sizes directly from RFC 8878 frame headers in Python (no slow full-file scan).
-- Compresses partitions in parallel with `zstd` (with XXH64 checksums enabled) and stores `.img.zst` entries uncompressed inside the ZIP so archives are never double-compressed.
-- Generates a POSIX `META-INF/com/google/android/update-binary` for custom recovery (TWRP, OrangeFox, PBRP, Lineage Recovery) plus Fastboot scripts for Windows (`flash_windows.bat`), Linux (`flash_linux.sh`), macOS (`flash_macos.sh`), and Android Termux (`flash_termux.sh`).
-- Writes a `META-INF/sha256sums.txt` manifest and verifies archive entries before touching any partition.
-- Hardened recovery install order: runs pre-flight checks, dynamically unmounts `/proc/mounts` dm devices, runs `lptools unlimited-group`, checks `lptools free` against required space, and allocates/flashes `super` dynamic partitions before touching `boot`, `vbmeta`, or low-level firmware.
-- Orders ZIP entries so `META-INF/`, scripts, and small boot/firmware images stay below the 4 GiB ZIP64 offset boundary before large dynamic partition images.
-- Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
+- Compresses partitions in parallel with `zstd` (with built-in XXH64 integrity checksums enabled) and stores `.img.zst` entries uncompressed inside the ZIP so archives are never double-compressed.
+- Streams unchanged `.img.zst` and raw `.img` files directly into the ZIP without extra temporary copies.
+- Hardened recovery install flow for TWRP, OrangeFox, PBRP, and Lineage Recovery:
+  - Matches device codenames cleanly across OEM prefixes (for example, `Infinix-X6871` matches `X6871`) and accepts comma-separated codenames.
+  - Dynamically unmounts `/proc/mounts` device-mapper entries before editing `super`.
+  - Clears stale logical partitions via `lpdump` and `/dev/block/mapper`, removes group size caps with `lptools unlimited-group`, and checks `lptools free` before touching `boot`, `vbmeta`, or firmware.
+  - Orders ZIP entries so `META-INF/` and small boot/firmware images stay below the 4 GiB ZIP64 boundary before large dynamic images.
+  - Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
+  - Reports real byte-weighted recovery progress and total flash time.
 - Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Safe (skip bootloader)` in GUI).
 - Supports safe AVB 2.0 flag patching on top-level `vbmeta` only (leaves chained `vbmeta_system` and `vbmeta_vendor` flags at 0 so `libavb` does not reject them).
-- Probes bundled binaries before using them and falls back to system `zstd` / `fastboot` or Python `zstandard` automatically on any CPU or OS.
+- Probes bundled binaries before using them and falls back to system `zstd` or Python `zstandard` automatically on any CPU or OS.
 
 ## Quick Start
 
@@ -45,10 +48,10 @@ chmod +x run.sh
 sudo apt install python3-tk
 ```
 
-On macOS, install Fastboot and Zstd via Homebrew if you plan to flash from macOS:
+On macOS, install Zstd via Homebrew for faster compression:
 
 ```bash
-brew install android-platform-tools zstd
+brew install zstd
 ```
 
 ### Android Termux
@@ -58,18 +61,19 @@ chmod +x run_termux.sh
 ./run_termux.sh
 ```
 
-`run_termux.sh` installs `python`, `zstd`, and `android-tools` if missing and starts the CLI.
+`run_termux.sh` installs `python` and `zstd` if missing and starts the CLI.
 
 ## GUI Usage
 
-1. Click **Browse...** and pick the folder containing your `.img` or `.img.zst` files.
-2. Review the partition list. Click any row (or press Space) to include or exclude specific partitions.
-3. Fill in Device Name, Codename, Version, and Maintainer (auto-filled if a `build.prop` is present).
+1. Click **Browse...** (`Ctrl+O`) and pick the folder containing your `.img` or `.img.zst` files.
+2. Review the color-coded partition list. Click any row (or press Space) to include or exclude specific partitions, or click **Safe (skip bootloader)**.
+3. Check Device Name, Codename, Version, and Maintainer (defaults to `Infinix GT 20 Pro` / `X6871` as an example, and auto-fills if a `build.prop` is present).
 4. Pick AVB mode (`skip`, `disable`, `enable`) and compression levels.
-   - ZSTD Level `1` is the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.
+   - ZSTD Level `1` gives the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.
    - ZIP Level only applies to raw images and scripts; `.img.zst` files are always stored uncompressed.
-5. Click **Preview Scripts** if you want to inspect the generated `update-binary` and Fastboot scripts first.
-6. Click **Build Flashable ZIP**. Finished packages are saved to `output/`.
+5. Check the live Output ZIP filename preview (click **Change Folder...** to pick a custom output directory).
+6. Click **Preview Script** to inspect or copy the generated `update-binary` before building.
+7. Click **Build Flashable ZIP** (`Ctrl+B`).
 
 ## CLI Usage
 
@@ -95,29 +99,16 @@ python main.py \
 
 Useful flags:
 
-- `--exclude preloader,lk` : skip specific partitions.
+- `--exclude preloader_raw,lk` : skip specific partitions.
 - `--keep-super` : keep unrelated stale partitions inside `super` instead of clearing them.
-- `--no-fastboot` : omit Fastboot scripts and host binaries from the ZIP.
-- `--no-checksum` : omit `META-INF/sha256sums.txt`.
-- `--print-scripts` : print all generated installer scripts without building a ZIP.
+- `--codename ""` : skip the on-device codename check (universal ZIP).
+- `--print-script` : print the generated `update-binary` without building a ZIP.
 - `-o /path/to/out.zip` : set a custom output file path.
 - `--gui` : open the desktop GUI.
 
 ## Flashing the Output ZIP
 
-### Custom Recovery
-
-Copy the `.zip` file to the phone and flash it in TWRP, OrangeFox, PBRP, or Lineage Recovery.
-
-### Fastboot (PC or Termux OTG)
-
-1. Extract the `.zip` file.
-2. Boot the phone into Bootloader / Fastboot mode.
-3. Run the script for your OS:
-   - Windows: `flash_windows.bat`
-   - Linux: `chmod +x flash_linux.sh && ./flash_linux.sh`
-   - macOS: `chmod +x flash_macos.sh && ./flash_macos.sh`
-   - Termux: `chmod +x flash_termux.sh && ./flash_termux.sh`
+Copy the generated `.zip` file to the phone and flash it in TWRP, OrangeFox, PBRP, or Lineage Recovery. Format Data if switching ROMs or Android versions.
 
 ## Project Layout
 
@@ -125,12 +116,11 @@ Copy the `.zip` file to the phone and flash it in TWRP, OrangeFox, PBRP, or Line
 Newbies-Flasher/
   bin/
     device/              ARM64 recovery helpers (zstd-arm64, lptools, avbctl)
-    linux/               Linux x86_64 fastboot and zstd
-    windows/             Windows fastboot.exe, AdbWin DLLs, zstd.exe
+    linux/               Linux x86_64 zstd
+    windows/             Windows zstd.exe
   flasher/
     avb.py               AVB 2.0 header reader and top-level vbmeta flag patcher
-    builder.py           Staging, unsparsing, parallel zstd, SHA-256 manifest, ZIP writer
-    fastboot_scripts.py  Windows, Linux, macOS, and Termux fastboot script generators
+    builder.py           Staging, unsparsing, parallel zstd, ZIP writer
     partitions.py        Scanner, RFC 8878 ZSTD size reader, build.prop parser
     platform_utils.py    OS detection and runtime binary probing
     recovery_script.py   POSIX recovery update-binary generator
@@ -147,7 +137,7 @@ Newbies-Flasher/
 ## Notes on Bundled Binaries
 
 - `bin/linux/zstd` requires a modern x86_64 CPU (`x86-64-v3`) and Linux kernel 6.1+. On older Linux systems, ARM64 Linux, or macOS, Newbies Flasher detects this at startup and automatically uses the system `zstd` binary or Python `zstandard`.
-- `bin/device/lptools` and `bin/device/avbctl` are dynamically linked ARM64 Android binaries; the generated `update-binary` tests them at runtime and falls back to recovery's own `lptools`/`avbctl` if linking fails.
+- `bin/device/lptools` and `bin/device/avbctl` are dynamically linked ARM64 Android binaries; the generated `update-binary` checks recovery's native binaries first and falls back to the bundled copies if needed.
 
 ## Running Tests
 

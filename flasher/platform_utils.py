@@ -5,7 +5,7 @@ import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BIN_DIR = ROOT_DIR / "bin"
@@ -51,9 +51,7 @@ def probe_executable(path: str, test_args: tuple = ("--version",)) -> bool:
             check=False,
         )
         return proc.returncode == 0
-    except OSError:
-        return False
-    except subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -77,26 +75,6 @@ def get_host_zstd() -> Optional[str]:
     return None
 
 
-def get_host_fastboot() -> Optional[str]:
-    host = detect_host_os()
-    arch = host_arch()
-
-    candidates: List[str] = []
-    if host == "windows":
-        candidates.append(str(BIN_DIR / "windows" / "fastboot.exe"))
-    elif host == "linux" and arch == "x86_64":
-        candidates.append(str(BIN_DIR / "linux" / "fastboot"))
-
-    sys_fb = shutil.which("fastboot.exe") if host == "windows" else shutil.which("fastboot")
-    if sys_fb:
-        candidates.append(sys_fb)
-
-    for cand in candidates:
-        if probe_executable(cand, ("--version",)):
-            return cand
-    return None
-
-
 def has_python_zstandard() -> bool:
     try:
         import zstandard  # noqa: F401
@@ -105,26 +83,10 @@ def has_python_zstandard() -> bool:
         return False
 
 
-def get_device_binaries() -> dict:
+def get_device_binaries() -> Dict[str, Path]:
     dev_dir = BIN_DIR / "device"
     names = ("zstd-arm64", "lptools", "avbctl")
     return {name: dev_dir / name for name in names if (dev_dir / name).is_file()}
-
-
-def get_fastboot_bundle_assets() -> dict:
-    win_dir = BIN_DIR / "windows"
-    lin_dir = BIN_DIR / "linux"
-    win_files = [
-        win_dir / name
-        for name in ("fastboot.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "zstd.exe")
-        if (win_dir / name).is_file()
-    ]
-    lin_files = [
-        lin_dir / name
-        for name in ("fastboot", "zstd")
-        if (lin_dir / name).is_file()
-    ]
-    return {"windows": win_files, "linux": lin_files}
 
 
 def reveal_in_file_manager(target_path: str) -> None:

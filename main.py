@@ -13,10 +13,15 @@ from flasher.builder import (
     BuildResult,
     build_package,
     format_output_filename,
-    preview_scripts,
+    preview_update_binary,
 )
 from flasher.partitions import detect_build_props, scan_partitions
 from flasher.platform_utils import detect_host_os, get_host_zstd, has_python_zstandard
+
+DEFAULT_DEVICE = "Infinix GT 20 Pro"
+DEFAULT_CODENAME = "X6871"
+DEFAULT_VERSION = "1.0"
+DEFAULT_MAINTAINER = "User"
 
 
 def clean_path(raw: str) -> str:
@@ -78,11 +83,11 @@ def interactive_flow() -> None:
     state = {
         "imgs_dir": "",
         "partitions": [],
-        "device": "Android Device",
-        "codename": "",
-        "version": "1.0",
+        "device": DEFAULT_DEVICE,
+        "codename": DEFAULT_CODENAME,
+        "version": DEFAULT_VERSION,
         "vbmeta": "skip",
-        "maintainer": "User",
+        "maintainer": DEFAULT_MAINTAINER,
         "zstd_level": 1,
         "zip_level": 1,
     }
@@ -110,11 +115,11 @@ def interactive_flow() -> None:
                 print(f"Found {len(parts)} partition image(s).")
 
                 props = detect_build_props(path_cand)
-                if props["device"] and state["device"] == "Android Device":
+                if props["device"] and state["device"] in ("", DEFAULT_DEVICE):
                     state["device"] = props["device"]
-                if props["codename"] and not state["codename"]:
+                if props["codename"] and state["codename"] in ("", DEFAULT_CODENAME):
                     state["codename"] = props["codename"]
-                if props["version"] and state["version"] == "1.0":
+                if props["version"] and state["version"] in ("", DEFAULT_VERSION):
                     state["version"] = props["version"]
 
                 step = 9 if return_to_review else 2
@@ -132,13 +137,15 @@ def interactive_flow() -> None:
                 return_to_review = False
 
             elif step == 3:
-                cur = state["codename"] or "optional"
-                val = input(f"Codename ({cur}) : ").strip()
+                cur = state["codename"] or "none"
+                val = input(f"Codename ({cur}, '-' for any) : ").strip()
                 if val.lower() in ("b", "back"):
                     step = 9 if return_to_review else 2
                     return_to_review = False
                     continue
-                if val:
+                if val == "-":
+                    state["codename"] = ""
+                elif val:
                     state["codename"] = val
                 step = 9 if return_to_review else 4
                 return_to_review = False
@@ -228,7 +235,7 @@ def interactive_flow() -> None:
                 print("Build Configuration")
                 print(f"  1. Images folder : {state['imgs_dir']} ({len(state['partitions'])} files)")
                 print(f"  2. Device name   : {state['device']}")
-                print(f"  3. Codename      : {state['codename'] or '(none)'}")
+                print(f"  3. Codename      : {state['codename'] or '(any)'}")
                 print(f"  4. Version       : {state['version']}")
                 print(f"  5. AVB 2.0       : {state['vbmeta']}")
                 print(f"  6. Maintainer    : {state['maintainer']}")
@@ -284,22 +291,20 @@ def interactive_flow() -> None:
 def cli_flow() -> None:
     parser = argparse.ArgumentParser(
         prog="newbies-flasher",
-        description="Build Android recovery and fastboot flashable ZIP packages from partition images.",
+        description="Build Android custom recovery flashable ZIP packages from partition images.",
     )
     parser.add_argument("-i", "--imgs", "--imgs-path", dest="imgs_path", help="Folder containing .img or .img.zst files")
-    parser.add_argument("-d", "--device", default="Android Device", help="Device name")
-    parser.add_argument("-c", "--codename", default="", help="Device codename for flashing check")
-    parser.add_argument("-v", "--version", default="1.0", help="ROM or firmware version")
-    parser.add_argument("-m", "--maintainer", default="User", help="Maintainer name")
+    parser.add_argument("-d", "--device", default=None, help=f"Device name (default: build.prop or '{DEFAULT_DEVICE}')")
+    parser.add_argument("-c", "--codename", default=None, help=f"Device codename for flashing check (default: build.prop or '{DEFAULT_CODENAME}'; pass '' to skip)")
+    parser.add_argument("-v", "--version", default=None, help=f"ROM or firmware version (default: build.prop or '{DEFAULT_VERSION}')")
+    parser.add_argument("-m", "--maintainer", default=DEFAULT_MAINTAINER, help="Maintainer name")
     parser.add_argument("--vbmeta", choices=("skip", "disable", "enable"), default="skip", help="AVB 2.0 vbmeta mode")
     parser.add_argument("--zstd-level", type=int, default=1, help="ZSTD compression level (0 disables zstd, 1-22 enables)")
     parser.add_argument("--zip-level", type=int, default=1, help="ZIP deflate level for raw files (0-9; .zst is always stored)")
     parser.add_argument("-o", "--output", help="Custom output ZIP path")
     parser.add_argument("--exclude", default="", help="Comma-separated partition names to skip")
-    parser.add_argument("--no-fastboot", action="store_true", help="Build recovery-only ZIP without fastboot installers")
-    parser.add_argument("--no-checksum", action="store_true", help="Skip generating SHA-256 verification manifest")
     parser.add_argument("--keep-super", action="store_true", help="Do not clear unrelated stale partitions in super")
-    parser.add_argument("--print-scripts", action="store_true", help="Print generated scripts and exit without building")
+    parser.add_argument("--print-script", action="store_true", help="Print generated update-binary and exit without building")
     parser.add_argument("--gui", action="store_true", help="Launch desktop GUI")
 
     args = parser.parse_args()
@@ -318,6 +323,11 @@ def cli_flow() -> None:
         print(f"Error: no .img or .img.zst files found in {imgs_path}")
         sys.exit(1)
 
+    props = detect_build_props(imgs_path)
+    device = args.device if args.device is not None else (props["device"] or DEFAULT_DEVICE)
+    codename = args.codename if args.codename is not None else (props["codename"] or DEFAULT_CODENAME)
+    version = args.version if args.version is not None else (props["version"] or DEFAULT_VERSION)
+
     excluded = {p.strip().lower() for p in args.exclude.split(",") if p.strip()}
     if excluded:
         from dataclasses import replace
@@ -326,29 +336,25 @@ def cli_flow() -> None:
     out_dir = os.path.join(ROOT_DIR, "output")
     os.makedirs(out_dir, exist_ok=True)
     out_zip = clean_path(args.output) if args.output else os.path.join(
-        out_dir, format_output_filename(args.device, args.version, args.codename)
+        out_dir, format_output_filename(device, version, codename)
     )
 
     cfg = BuildConfig(
         imgs_dir=imgs_path,
         output_zip=out_zip,
-        device=args.device,
-        codename=args.codename,
-        version=args.version,
+        device=device,
+        codename=codename,
+        version=version,
         maintainer=args.maintainer,
         vbmeta_mode=args.vbmeta,
         zstd_level=args.zstd_level,
         zip_level=args.zip_level,
-        include_fastboot=not args.no_fastboot,
-        verify_sha256=not args.no_checksum,
         clean_super=not args.keep_super,
         partitions=parts,
     )
 
-    if args.print_scripts:
-        for name, content in preview_scripts(cfg).items():
-            print(f"===== {name} =====")
-            print(content)
+    if args.print_script:
+        print(preview_update_binary(cfg))
         return
 
     res = build_package(cfg)
