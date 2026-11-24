@@ -303,7 +303,6 @@ def cli_flow() -> None:
     parser.add_argument("--zip-level", type=int, default=1, help="ZIP deflate level for raw files (0-9; .zst is always stored)")
     parser.add_argument("-o", "--output", help="Custom output ZIP path")
     parser.add_argument("--exclude", default="", help="Comma-separated partition names to skip")
-    parser.add_argument("--keep-super", action="store_true", help="Do not clear unrelated stale partitions in super")
     parser.add_argument("--print-script", action="store_true", help="Print generated update-binary and exit without building")
     parser.add_argument("--gui", action="store_true", help="Launch desktop GUI")
 
@@ -349,7 +348,6 @@ def cli_flow() -> None:
         vbmeta_mode=args.vbmeta,
         zstd_level=args.zstd_level,
         zip_level=args.zip_level,
-        clean_super=not args.keep_super,
         partitions=parts,
     )
 

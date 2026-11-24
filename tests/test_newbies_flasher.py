@@ -42,6 +42,7 @@ from flasher.sparse import (
     get_sparse_uncompressed_size,
     is_sparse_image,
     unsparse_image,
+    unsparse_to_stream,
 )
 
 
@@ -101,7 +102,7 @@ class TestNewbiesFlasher(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_sparse_detection_and_unsparse_zero_fill(self) -> None:
+    def test_sparse_detection_unsparse_and_stream_identical(self) -> None:
         sp_path = os.path.join(self.tmp, "sparse_vendor.img")
         raw_path = os.path.join(self.tmp, "vendor_raw.img")
         expected = _make_sparse_test_image(sp_path)
@@ -115,6 +116,11 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertEqual(out_sz, len(expected))
         with open(raw_path, "rb") as f:
             self.assertEqual(f.read(), expected)
+
+        streamed = bytearray()
+        stream_sz = unsparse_to_stream(sp_path, lambda mv: streamed.extend(mv))
+        self.assertEqual(stream_sz, len(expected))
+        self.assertEqual(bytes(streamed), expected)
 
     def test_zstd_frame_header_size_without_cli_or_python_lib(self) -> None:
         raw_path = os.path.join(self.tmp, "sample.img")
@@ -153,7 +159,7 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertEqual(props["codename"], "testphone")
         self.assertEqual(props["version"], "2.5.0")
 
-    def test_full_build_recovery_only_no_fastboot_no_sha256_and_zip_order(self) -> None:
+    def test_full_build_sparse_stream_no_stale_wipe_and_zip_order(self) -> None:
         sp_vendor = os.path.join(self.imgs, "vendor.img")
         expected_vendor = _make_sparse_test_image(sp_vendor)
 
@@ -169,7 +175,6 @@ class TestNewbiesFlasher(unittest.TestCase):
             vbmeta_mode="disable",
             zstd_level=1,
             zip_level=5,
-            clean_super=True,
             partitions=parts,
         )
 
@@ -216,14 +221,14 @@ class TestNewbiesFlasher(unittest.TestCase):
 
             ub = zf.read("META-INF/com/google/android/update-binary").decode("utf-8")
             self.assertIn(f"lp_create_slot vendor {len(expected_vendor)}", ub)
+            self.assertIn("lp_clear_one vendor", ub)
             self.assertIn("unlimited-group", ub)
-            self.assertIn("lp_clear_all_stale", ub)
-            self.assertIn("lpdump", ub)
             self.assertIn("/proc/mounts", ub)
             self.assertIn("unlock_block_rw", ub)
             self.assertIn("check_block_fits", ub)
             self.assertIn("END_TS=$(date +%s", ub)
             self.assertIn("Installation complete${ELAPSED}", ub)
+            self.assertNotIn("lp_clear_all_stale", ub)
             self.assertNotIn("--no-check", ub)
             self.assertNotIn("sha256sums.txt", ub)
             self.assertNotIn("verify_manifest", ub)
@@ -232,8 +237,18 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertLess(ub.index("[2/4] Dynamic / Super partitions"), ub.index("[3/4] Bootchain & AVB 2.0"))
             self.assertLess(ub.index("[3/4] Bootchain & AVB 2.0"), ub.index("[4/4] Firmware partitions"))
 
-            # Verify top-level vbmeta patched (flags=3) and chained vbmeta_system intact (flags=0)
+            # Verify direct sparse->zstd payload matches expected raw bytes and carries exact FCS header
             zbin = get_host_zstd()
+            vnd_zst = os.path.join(self.tmp, "chk_vendor.zst")
+            vnd_raw = os.path.join(self.tmp, "chk_vendor.img")
+            with open(vnd_zst, "wb") as f:
+                f.write(zf.read("vendor.img.zst"))
+            self.assertEqual(read_zstd_frame_content_size(vnd_zst), len(expected_vendor))
+            subprocess.run([zbin, "-d", "-f", "-q", vnd_zst, "-o", vnd_raw], check=True)
+            with open(vnd_raw, "rb") as f:
+                self.assertEqual(f.read(), expected_vendor)
+
+            # Verify top-level vbmeta patched (flags=3) and chained vbmeta_system intact (flags=0)
             vb_zst = os.path.join(self.tmp, "chk_vb.zst")
             vb_raw = os.path.join(self.tmp, "chk_vb.img")
             vbs_zst = os.path.join(self.tmp, "chk_vbs.zst")
@@ -246,6 +261,16 @@ class TestNewbiesFlasher(unittest.TestCase):
             subprocess.run([zbin, "-d", "-f", "-q", vbs_zst, "-o", vbs_raw], check=True)
             self.assertEqual(read_vbmeta_flags(vb_raw), 3)
             self.assertEqual(read_vbmeta_flags(vbs_raw), 0)
+
+    def test_raw_mode_parallel_unsparse_build(self) -> None:
+        sp_vendor = os.path.join(self.imgs, "vendor.img")
+        expected_vendor = _make_sparse_test_image(sp_vendor)
+        out_zip = os.path.join(self.tmp, "raw_out.zip")
+        cfg = BuildConfig(imgs_dir=self.imgs, output_zip=out_zip, zstd_level=0, zip_level=1)
+        res = build_package(cfg)
+        self.assertTrue(os.path.isfile(res.output_zip))
+        with zipfile.ZipFile(res.output_zip, "r") as zf:
+            self.assertEqual(zf.read("vendor.img"), expected_vendor)
 
     def test_zero_copy_repack_of_precompressed_zst(self) -> None:
         zst_dir = os.path.join(self.tmp, "zst_imgs")
@@ -292,17 +317,21 @@ class TestNewbiesFlasher(unittest.TestCase):
             build_package(cfg, cancel_event=ev)
         self.assertFalse(os.path.exists(out_zip))
 
-    def test_output_filename_sanitization(self) -> None:
+    def test_output_filename_codename_version_format(self) -> None:
         self.assertEqual(
             format_output_filename("Infinix GT 20 Pro", "15.1.2", "X6871"),
-            "Infinix-GT-20-Pro-X6871-15.1.2-Flashable.zip",
+            "X6871-15.1.2-Flashable.zip",
         )
         self.assertEqual(
-            format_output_filename("X6871", "1.0", "X6871"),
+            format_output_filename("Infinix GT 20 Pro", "1.0", "X6871"),
             "X6871-1.0-Flashable.zip",
         )
+        self.assertEqual(
+            format_output_filename("Infinix GT 20 Pro", "1.0", ""),
+            "Infinix-GT-20-Pro-1.0-Flashable.zip",
+        )
 
-    def test_gui_defaults_live_preview_fits_768p_and_safe_select(self) -> None:
+    def test_gui_defaults_sliders_naming_fits_768p_and_safe_select(self) -> None:
         import tkinter as tk
         from gui import NewbiesFlasherApp
 
@@ -317,13 +346,36 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertEqual(app.codename_var.get(), "X6871")
             self.assertFalse(hasattr(app, "fastboot_var"))
             self.assertFalse(hasattr(app, "sha256_var"))
-            self.assertEqual(app.out_name_lbl.cget("text"), "Infinix-GT-20-Pro-X6871-1.0-Flashable.zip")
+            self.assertFalse(hasattr(app, "clean_super_var"))
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-1.0-Flashable.zip")
 
             app.version_var.set("15.1.2")
-            self.assertEqual(app.out_name_lbl.cget("text"), "Infinix-GT-20-Pro-X6871-15.1.2-Flashable.zip")
+            self.assertEqual(app.out_name_lbl.cget("text"), "X6871-15.1.2-Flashable.zip")
+
+            # Verify ZSTD and ZIP sliders step cleanly without snapping back and sync labels
+            app.zstd_slider.step(1)
+            self.assertEqual(app.zstd_var.get(), 2)
+            self.assertIn("Level 2", app.zstd_lbl.cget("text"))
+            self.assertIn("Scripts only", app.zip_lbl.cget("text"))
+
+            app.zstd_var.set(0)
+            self.assertEqual(app.zstd_var.get(), 0)
+            self.assertIn("Off", app.zstd_lbl.cget("text"))
+            self.assertIn("raw images", app.zip_title_lbl.cget("text"))
+
+            app.zip_slider.step(3)
+            self.assertEqual(app.zip_var.get(), 4)
+            self.assertIn("Deflate 4", app.zip_lbl.cget("text"))
+
+            # Verify clamping at bounds
+            app.zip_slider.step(50)
+            self.assertEqual(app.zip_var.get(), 9)
+            app.zip_slider.step(-50)
+            self.assertEqual(app.zip_var.get(), 0)
 
             app.partitions = scan_partitions(self.imgs)
             app._refresh_tree()
+            app._sort_partitions("raw")
             root.update_idletasks()
 
             # Ensure requested UI height fits inside a standard 768p laptop screen

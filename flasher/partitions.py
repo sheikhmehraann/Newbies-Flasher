@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from .platform_utils import get_host_zstd
-from .sparse import get_sparse_uncompressed_size, is_sparse_image
+from .sparse import parse_sparse_header_bytes
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 ZSTD_SKIPPABLE_LOW = 0x184D2A50
@@ -58,35 +58,90 @@ class PartitionImage:
     selected: bool = True
 
 
-def is_zstd_file(path: str) -> bool:
-    if not os.path.isfile(path) or os.path.getsize(path) < 4:
+def _is_zstd_magic(head: bytes) -> bool:
+    if len(head) < 4:
         return False
+    if head[:4] == ZSTD_MAGIC:
+        return True
+    val = struct.unpack_from("<I", head, 0)[0]
+    return ZSTD_SKIPPABLE_LOW <= val <= ZSTD_SKIPPABLE_HIGH
+
+
+def is_zstd_file(path: str) -> bool:
     try:
         with open(path, "rb") as f:
-            magic = f.read(4)
-            if magic == ZSTD_MAGIC:
-                return True
-            val = struct.unpack("<I", magic)[0]
-            return ZSTD_SKIPPABLE_LOW <= val <= ZSTD_SKIPPABLE_HIGH
+            return _is_zstd_magic(f.read(4))
     except OSError:
         return False
+
+
+def _is_raw_fs_header(head: bytes) -> bool:
+    if len(head) >= 1028 and head[1024:1028] in (b"\xe2\xe1\xf5\xe0", b"\x10\x20\xf5\xf2"):
+        return True
+    if len(head) >= 1082 and head[1080:1082] == b"\x53\xef":
+        return True
+    return False
 
 
 def is_raw_filesystem(path: str) -> bool:
-    if not os.path.isfile(path) or os.path.getsize(path) < 2048:
-        return False
     try:
         with open(path, "rb") as f:
-            f.seek(1024)
-            head = f.read(4)
-            if head in (b"\xe2\xe1\xf5\xe0", b"\x10\x20\xf5\xf2"):
-                return True
-            f.seek(1080)
-            if f.read(2) == b"\x53\xef":
-                return True
+            return _is_raw_fs_header(f.read(1088))
     except OSError:
-        pass
-    return False
+        return False
+
+
+def _parse_zstd_fcs_from_bytes(buf: bytes) -> Optional[int]:
+    """Fast in-memory RFC 8878 ZSTD Frame_Content_Size parser for common single-frame headers."""
+    pos = 0
+    n = len(buf)
+    while pos + 4 <= n:
+        magic = buf[pos:pos + 4]
+        if magic == ZSTD_MAGIC:
+            pos += 4
+            break
+        val = struct.unpack_from("<I", buf, pos)[0]
+        if ZSTD_SKIPPABLE_LOW <= val <= ZSTD_SKIPPABLE_HIGH:
+            if pos + 8 > n:
+                return None
+            skip_len = struct.unpack_from("<I", buf, pos + 4)[0]
+            pos += 8 + skip_len
+            continue
+        return None
+    else:
+        return None
+
+    if pos >= n:
+        return None
+    fhd = buf[pos]
+    pos += 1
+    fcs_flag = (fhd >> 6) & 0x03
+    single_segment = (fhd >> 5) & 0x01
+    dict_id_flag = fhd & 0x03
+
+    window_sz = 0 if single_segment else 1
+    dict_id_sz = (0, 1, 2, 4)[dict_id_flag]
+    if fcs_flag == 0:
+        fcs_sz = 1 if single_segment else 0
+    elif fcs_flag == 1:
+        fcs_sz = 2
+    elif fcs_flag == 2:
+        fcs_sz = 4
+    else:
+        fcs_sz = 8
+
+    if fcs_sz == 0:
+        return None
+    pos += window_sz + dict_id_sz
+    if pos + fcs_sz > n:
+        return None
+    if fcs_sz == 1:
+        return buf[pos]
+    if fcs_sz == 2:
+        return struct.unpack_from("<H", buf, pos)[0] + 256
+    if fcs_sz == 4:
+        return struct.unpack_from("<I", buf, pos)[0]
+    return struct.unpack_from("<Q", buf, pos)[0]
 
 
 def read_zstd_frame_content_size(path: str) -> Optional[int]:
@@ -149,7 +204,12 @@ def read_zstd_frame_content_size(path: str) -> Optional[int]:
         return None
 
 
-def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None) -> int:
+def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None, header_bytes: Optional[bytes] = None) -> int:
+    if header_bytes:
+        fast_sz = _parse_zstd_fcs_from_bytes(header_bytes)
+        if fast_sz is not None and fast_sz > 0:
+            return fast_sz
+
     hdr_size = read_zstd_frame_content_size(path)
     if hdr_size is not None and hdr_size > 0:
         return hdr_size
@@ -206,7 +266,7 @@ def strip_image_suffix(filename: str) -> Optional[str]:
     return None
 
 
-def classify_partition(name: str, path: str, fmt: str) -> str:
+def classify_partition(name: str, path: str, fmt: str, header_bytes: Optional[bytes] = None) -> str:
     n = name.lower()
     if n == "super":
         return "super_raw"
@@ -218,8 +278,12 @@ def classify_partition(name: str, path: str, fmt: str) -> str:
         return "bootloader"
     if n in FIRMWARE_PARTITIONS:
         return "firmware"
-    if fmt == "raw" and is_raw_filesystem(path):
-        return "dynamic"
+    if fmt == "raw":
+        if header_bytes is not None:
+            if _is_raw_fs_header(header_bytes):
+                return "dynamic"
+        elif path and is_raw_filesystem(path):
+            return "dynamic"
     if fmt == "sparse":
         return "dynamic"
     return "firmware"
@@ -244,24 +308,35 @@ def scan_partitions(directory: str, zstd_bin: Optional[str] = None) -> List[Part
             continue
 
         fpath = os.path.join(root, fname)
-        if not os.path.isfile(fpath):
+        try:
+            st = os.stat(fpath)
+        except OSError:
             continue
-
-        file_size = os.path.getsize(fpath)
+        file_size = st.st_size
         if file_size == 0:
             continue
 
-        if is_zstd_file(fpath):
-            fmt = "zstd"
-            raw_size = get_zstd_uncompressed_size(fpath, zstd_bin=zstd_bin)
-        elif is_sparse_image(fpath):
-            fmt = "sparse"
-            raw_size = get_sparse_uncompressed_size(fpath) or file_size
-        else:
-            fmt = "raw"
-            raw_size = file_size
+        # Single file open reads enough header bytes for ZSTD, Android sparse, and ext4/erofs/f2fs detection.
+        try:
+            with open(fpath, "rb") as fh:
+                head = fh.read(1088)
+        except OSError:
+            continue
 
-        kind = classify_partition(base, fpath, fmt)
+        if _is_zstd_magic(head):
+            fmt = "zstd"
+            raw_size = get_zstd_uncompressed_size(fpath, zstd_bin=zstd_bin, header_bytes=head)
+        else:
+            sp_hdr = parse_sparse_header_bytes(head)
+            if sp_hdr is not None:
+                fmt = "sparse"
+                _, _, blk_sz, total_blks, _ = sp_hdr
+                raw_size = blk_sz * total_blks or file_size
+            else:
+                fmt = "raw"
+                raw_size = file_size
+
+        kind = classify_partition(base, fpath, fmt, header_bytes=head)
         found[base] = PartitionImage(
             name=base,
             path=fpath,

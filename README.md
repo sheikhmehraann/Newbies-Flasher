@@ -7,17 +7,18 @@ Requires Python 3.8 or newer. No external Python packages are needed.
 ## What It Does
 
 - Packages `.img`, Android sparse `.img`, and `.img.zst` files into a clean recovery flashable ZIP (`META-INF/com/google/android/update-binary`).
-- Automatically detects Android sparse images and unsparses them before packing so custom recovery writes clean raw images.
-- Reads Zstandard uncompressed partition sizes directly from RFC 8878 frame headers in Python (no slow full-file scan).
-- Compresses partitions in parallel with `zstd` (with built-in XXH64 integrity checksums enabled) and stores `.img.zst` entries uncompressed inside the ZIP so archives are never double-compressed.
-- Streams unchanged `.img.zst` and raw `.img` files directly into the ZIP without extra temporary copies.
+- Automatically detects Android sparse images and streams unsparsed blocks directly into `zstd` without writing multi-GB temporary raw images to disk.
+- Reads Zstandard uncompressed partition sizes directly from RFC 8878 frame headers in a single file open (no slow full-file scan).
+- Compresses small images in parallel and saturates CPU cores across large partitions with `zstd` (XXH64 checksums enabled), storing `.img.zst` entries uncompressed inside the ZIP so archives are never double-compressed.
+- Streams unchanged `.img.zst` and raw `.img` files directly into the ZIP using a reusable 16 MiB I/O buffer without extra temporary copies.
+- Names output packages cleanly as `Codename-Version-Flashable.zip` (for example, `X6871-1.0-Flashable.zip`; falls back to `Device-Version-Flashable.zip` if Codename is left blank).
 - Hardened recovery install flow for TWRP, OrangeFox, PBRP, and Lineage Recovery:
-  - Matches device codenames cleanly across OEM prefixes (for example, `Infinix-X6871` matches `X6871`) and accepts comma-separated codenames.
+  - Matches device codenames across OEM prefixes (for example, `Infinix-X6871` matches `X6871`) and accepts comma-separated codenames.
   - Dynamically unmounts `/proc/mounts` device-mapper entries before editing `super`.
-  - Clears stale logical partitions via `lpdump` and `/dev/block/mapper`, removes group size caps with `lptools unlimited-group`, and checks `lptools free` before touching `boot`, `vbmeta`, or firmware.
+  - Only clears and recreates the dynamic partitions included in the ZIP, removes group size caps with `lptools unlimited-group`, and checks `lptools free` before touching `boot`, `vbmeta`, or firmware.
   - Orders ZIP entries so `META-INF/` and small boot/firmware images stay below the 4 GiB ZIP64 boundary before large dynamic images.
   - Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
-  - Reports real byte-weighted recovery progress and total flash time.
+  - Reports byte-weighted recovery progress and total flash time.
 - Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Safe (skip bootloader)` in GUI).
 - Supports safe AVB 2.0 flag patching on top-level `vbmeta` only (leaves chained `vbmeta_system` and `vbmeta_vendor` flags at 0 so `libavb` does not reject them).
 - Probes bundled binaries before using them and falls back to system `zstd` or Python `zstandard` automatically on any CPU or OS.
@@ -66,12 +67,12 @@ chmod +x run_termux.sh
 ## GUI Usage
 
 1. Click **Browse...** (`Ctrl+O`) and pick the folder containing your `.img` or `.img.zst` files.
-2. Review the color-coded partition list. Click any row (or press Space) to include or exclude specific partitions, or click **Safe (skip bootloader)**.
+2. Review the color-coded partition list (click any column header to sort). Click any row (or press Space) to include or exclude specific partitions, or click **Safe (skip bootloader)**.
 3. Check Device Name, Codename, Version, and Maintainer (defaults to `Infinix GT 20 Pro` / `X6871` as an example, and auto-fills if a `build.prop` is present).
-4. Pick AVB mode (`skip`, `disable`, `enable`) and compression levels.
+4. Pick AVB mode (`skip`, `disable`, `enable`) and adjust the ZSTD / ZIP sliders (drag, click anywhere on the bar, scroll, or use `-` / `+`).
    - ZSTD Level `1` gives the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.
-   - ZIP Level only applies to raw images and scripts; `.img.zst` files are always stored uncompressed.
-5. Check the live Output ZIP filename preview (click **Change Folder...** to pick a custom output directory).
+   - ZIP Level only applies to scripts when ZSTD is enabled, or to raw `.img` files when ZSTD is `0`.
+5. Check the live Output ZIP preview (`X6871-1.0-Flashable.zip`) and click **Change Folder...** if you want a custom output directory.
 6. Click **Preview Script** to inspect or copy the generated `update-binary` before building.
 7. Click **Build Flashable ZIP** (`Ctrl+B`).
 
@@ -100,7 +101,6 @@ python main.py \
 Useful flags:
 
 - `--exclude preloader_raw,lk` : skip specific partitions.
-- `--keep-super` : keep unrelated stale partitions inside `super` instead of clearing them.
 - `--codename ""` : skip the on-device codename check (universal ZIP).
 - `--print-script` : print the generated `update-binary` without building a ZIP.
 - `-o /path/to/out.zip` : set a custom output file path.
@@ -120,11 +120,11 @@ Newbies-Flasher/
     windows/             Windows zstd.exe
   flasher/
     avb.py               AVB 2.0 header reader and top-level vbmeta flag patcher
-    builder.py           Staging, unsparsing, parallel zstd, ZIP writer
-    partitions.py        Scanner, RFC 8878 ZSTD size reader, build.prop parser
+    builder.py           Streaming sparse->zstd pipeline, parallel compression, ZIP writer
+    partitions.py        Single-open scanner, RFC 8878 ZSTD size reader, build.prop parser
     platform_utils.py    OS detection and runtime binary probing
     recovery_script.py   POSIX recovery update-binary generator
-    sparse.py            Pure-Python Android sparse image parser and unsparser
+    sparse.py            Pure-Python Android sparse image parser and streaming unsparser
   tests/
     test_newbies_flasher.py
   gui.py                 Tkinter desktop GUI

@@ -17,7 +17,6 @@ def generate_update_binary(
     firmware_specs: List[Tuple[str, int]],
     vbmeta_mode: str = "skip",
     use_zstd: bool = True,
-    clean_super: bool = True,
     super_raw_size: int = 0,
 ) -> str:
     ext = ".img.zst" if use_zstd else ".img"
@@ -278,37 +277,6 @@ def generate_update_binary(
         "    fi",
         "}",
         "",
-        "lp_is_protected() {",
-        '    case "$1" in',
-        "        control|by-uuid|userdata|metadata|cache|persist|misc|frp|nvdata|nvram|protect*|proinfo|seccfg|*-verity*) return 0 ;;",
-        "    esac",
-        "    return 1",
-        "}",
-        "",
-        "lp_clear_all_stale() {",
-        "    if command -v lpdump >/dev/null 2>&1; then",
-        "        lp_names=$(lpdump 2>/dev/null | awk '/^Partition table:/{p=1;next} /^[A-Z]/{p=0} p && /^  Name:/{print $2}')",
-        "        for nm in $lp_names; do",
-        '            lp_is_protected "$nm" && continue',
-        '            "$LPTOOLS" unmap "$nm" >/dev/null 2>&1 || true',
-        '            "$LPTOOLS" remove "$nm" >/dev/null 2>&1 || true',
-        "        done",
-        "    fi",
-        "    if [ -d /dev/block/mapper ]; then",
-        "        for node in /dev/block/mapper/*; do",
-        '            [ -e "$node" ] || continue',
-        '            nm=$(basename "$node")',
-        '            lp_is_protected "$nm" && continue',
-        '            "$LPTOOLS" unmap "$nm" >/dev/null 2>&1 || true',
-        '            "$LPTOOLS" remove "$nm" >/dev/null 2>&1 || true',
-        '            case "$nm" in',
-        '                *_a) other="${nm%_a}_b"; "$LPTOOLS" unmap "$other" >/dev/null 2>&1 || true; "$LPTOOLS" remove "$other" >/dev/null 2>&1 || true ;;',
-        '                *_b) other="${nm%_b}_a"; "$LPTOOLS" unmap "$other" >/dev/null 2>&1 || true; "$LPTOOLS" remove "$other" >/dev/null 2>&1 || true ;;',
-        "            esac",
-        "        done",
-        "    fi",
-        "}",
-        "",
         "lp_create_slot() {",
         '    p="$1"; sz="$2"',
         "    rm -f /tmp/nf_err.log",
@@ -410,8 +378,6 @@ def generate_update_binary(
                 '[ -n "$super_dev" ] || abort "Device does not have a super partition"',
                 '"$LPTOOLS" clear-cow >/dev/null 2>&1 || true',
             ])
-            if clean_super:
-                lines.append("lp_clear_all_stale")
             for part, _ in dynamic_specs:
                 lines.append(f"lp_clear_one {_q(part)}")
             lines.append('"$LPTOOLS" unlimited-group >/dev/null 2>&1 || true')

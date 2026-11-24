@@ -19,10 +19,11 @@ from .platform_utils import (
     has_python_zstandard,
 )
 from .recovery_script import generate_update_binary
-from .sparse import unsparse_image
+from .sparse import get_sparse_uncompressed_size, unsparse_image, unsparse_to_stream
 
 ZIP64_THRESHOLD = 0xFFFFFFFF - (16 * 1024 * 1024)
-COPY_BUF = 8 * 1024 * 1024
+COPY_BUF = 16 * 1024 * 1024
+LARGE_IMAGE_BYTES = 64 * 1024 * 1024
 ALREADY_COMPRESSED_EXTS = (".zst", ".gz", ".xz", ".bz2", ".lz4", ".zip")
 
 
@@ -37,7 +38,6 @@ class BuildConfig:
     vbmeta_mode: str = "skip"
     zstd_level: int = 1
     zip_level: int = 1
-    clean_super: bool = True
     partitions: Optional[List[PartitionImage]] = None
 
 
@@ -74,16 +74,11 @@ def format_output_filename(device: str, version: str, codename: str = "") -> str
         s = re.sub(r"[^a-zA-Z0-9.-]", "", s)
         return re.sub(r"-+", "-", s).strip("-")
 
+    code = clean(codename)
     dev = clean(device) or "Device"
     ver = clean(version) or "1.0"
-    code = clean(codename)
-
-    parts = [dev]
-    if code and code.lower() not in dev.lower():
-        parts.append(code)
-    parts.append(ver)
-    parts.append("Flashable.zip")
-    return "-".join(parts)
+    primary = code or dev
+    return f"{primary}-{ver}-Flashable.zip"
 
 
 def sanitize_output_path(output_zip: str) -> str:
@@ -95,6 +90,25 @@ def sanitize_output_path(output_zip: str) -> str:
     if not clean_base.lower().endswith(".zip"):
         clean_base += ".zip"
     return os.path.join(out_dir, clean_base) if out_dir else clean_base
+
+
+def _wait_proc(proc: subprocess.Popen, cancel_event: Optional[threading.Event]) -> Tuple[int, bytes]:
+    while True:
+        if cancel_event and cancel_event.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            raise RuntimeError("Build cancelled")
+        try:
+            proc.wait(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    err_bytes = proc.stderr.read() if proc.stderr else b""
+    return proc.returncode, err_bytes
 
 
 def _run_zstd_compress(
@@ -117,14 +131,7 @@ def _run_zstd_compress(
         args.extend([src, "-o", dst])
 
         with subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as proc:
-            while proc.poll() is None:
-                if cancel_event and cancel_event.is_set():
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    raise RuntimeError("Build cancelled")
-                time.sleep(0.05)
-            err_bytes = proc.stderr.read() if proc.stderr else b""
-            rc = proc.returncode
+            rc, err_bytes = _wait_proc(proc, cancel_event)
         if rc == 0 and os.path.isfile(dst):
             return
         err = err_bytes.decode("utf-8", errors="replace").strip()
@@ -144,15 +151,90 @@ def _run_zstd_compress(
     except TypeError:
         cctx = zstandard.ZstdCompressor(level=c_level, write_checksum=True, write_content_size=True)
     src_size = os.path.getsize(src)
+    buf = bytearray(COPY_BUF)
+    mv = memoryview(buf)
     with open(src, "rb") as ifh, open(dst, "wb") as ofh:
         with cctx.stream_writer(ofh, size=src_size, closefd=False) as writer:
             while True:
                 if cancel_event and cancel_event.is_set():
                     raise RuntimeError("Build cancelled")
-                buf = ifh.read(COPY_BUF)
-                if not buf:
+                n = ifh.readinto(buf)
+                if not n:
                     break
-                writer.write(buf)
+                writer.write(mv[:n])
+
+
+def _run_sparse_to_zstd(
+    src: str,
+    dst: str,
+    level: int,
+    threads: int,
+    zstd_bin: Optional[str],
+    stage_dir: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> int:
+    """Stream Android sparse unsparsing directly into zstd without writing a raw temp image."""
+    cancel_check = (lambda: bool(cancel_event and cancel_event.is_set()))
+    expected_sz = get_sparse_uncompressed_size(src) or 0
+
+    if zstd_bin and expected_sz > 0:
+        args = [zstd_bin, f"-T{threads}", f"--stream-size={expected_sz}", "-f", "-q"]
+        if level >= 20:
+            args.extend([f"-{level}", "--ultra"])
+        else:
+            args.append(f"-{max(1, level)}")
+        args.extend(["-o", dst])
+
+        try:
+            with subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            ) as proc:
+                assert proc.stdin is not None
+                try:
+                    raw_sz = unsparse_to_stream(src, proc.stdin.write, cancel_check=cancel_check)
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+                rc, _ = _wait_proc(proc, cancel_event)
+            if rc == 0 and os.path.isfile(dst):
+                return raw_sz
+        except BrokenPipeError:
+            pass
+        if os.path.exists(dst):
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+
+    if not zstd_bin and has_python_zstandard() and expected_sz > 0:
+        import zstandard
+        c_level = max(1, min(level, 22))
+        try:
+            cctx = zstandard.ZstdCompressor(level=c_level, threads=threads, write_checksum=True, write_content_size=True)
+        except TypeError:
+            cctx = zstandard.ZstdCompressor(level=c_level, write_checksum=True, write_content_size=True)
+        with open(dst, "wb") as ofh:
+            with cctx.stream_writer(ofh, size=expected_sz, closefd=False) as writer:
+                return unsparse_to_stream(src, writer.write, cancel_check=cancel_check)
+
+    # Fallback if an old system zstd does not support --stream-size.
+    tmp_raw = os.path.join(stage_dir, f"{os.path.basename(dst)}.raw")
+    try:
+        raw_sz = unsparse_image(src, tmp_raw, cancel_check=cancel_check)
+        _run_zstd_compress(tmp_raw, dst, level, threads, zstd_bin, cancel_event)
+        return raw_sz
+    finally:
+        if os.path.exists(tmp_raw):
+            try:
+                os.remove(tmp_raw)
+            except OSError:
+                pass
 
 
 def _run_zstd_decompress(
@@ -170,14 +252,7 @@ def _run_zstd_decompress(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         ) as proc:
-            while proc.poll() is None:
-                if cancel_event and cancel_event.is_set():
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    raise RuntimeError("Build cancelled")
-                time.sleep(0.05)
-            err_bytes = proc.stderr.read() if proc.stderr else b""
-            rc = proc.returncode
+            rc, err_bytes = _wait_proc(proc, cancel_event)
         if rc == 0 and os.path.isfile(dst):
             return os.path.getsize(dst)
         err = err_bytes.decode("utf-8", errors="replace").strip()
@@ -228,7 +303,6 @@ def preview_update_binary(cfg: BuildConfig) -> str:
         firmware_specs=fw_specs,
         vbmeta_mode=cfg.vbmeta_mode,
         use_zstd=use_zstd,
-        clean_super=cfg.clean_super,
         super_raw_size=super_raw_size,
     )
 
@@ -286,6 +360,9 @@ def _pack_zip(
 
     written_bytes = 0
     pack_start = time.monotonic()
+    last_prog_ts = 0.0
+    buf = bytearray(COPY_BUF)
+    mv = memoryview(buf)
     default_comp = zipfile.ZIP_STORED if zip_level <= 0 else zipfile.ZIP_DEFLATED
     zip_kwargs = {"compresslevel": min(9, zip_level)} if zip_level > 0 else {}
 
@@ -318,16 +395,19 @@ def _pack_zip(
                 while True:
                     if cancel_event and cancel_event.is_set():
                         raise RuntimeError("Build cancelled")
-                    buf = src_f.read(COPY_BUF)
-                    if not buf:
+                    n = src_f.readinto(buf)
+                    if not n:
                         break
-                    dst_f.write(buf)
-                    written_bytes += len(buf)
+                    dst_f.write(mv[:n])
+                    written_bytes += n
                     if on_progress and total_bytes > 0:
-                        dt = max(0.05, time.monotonic() - pack_start)
-                        mbps = (written_bytes / 1048576.0) / dt
-                        pct = 68.0 + (31.0 * written_bytes / total_bytes)
-                        on_progress(min(99.0, pct), f"Packing {rp} ({mbps:.0f} MB/s)")
+                        now = time.monotonic()
+                        if now - last_prog_ts >= 0.06 or written_bytes >= total_bytes:
+                            last_prog_ts = now
+                            dt = max(0.05, now - pack_start)
+                            mbps = (written_bytes / 1048576.0) / dt
+                            pct = 68.0 + (31.0 * written_bytes / total_bytes)
+                            on_progress(min(99.0, pct), f"Packing {rp} ({mbps:.0f} MB/s)")
 
 
 def build_package(
@@ -382,22 +462,19 @@ def build_package(
         progress(6.0, "Preparing images")
         prepared: Dict[str, Tuple[PartitionImage, str, str, int]] = {}
 
-        for idx, p in enumerate(selected, 1):
+        for p in selected:
             check_cancel()
             eff_path = p.path
             eff_fmt = p.fmt
             eff_raw = p.raw_size
 
-            if eff_fmt == "sparse":
-                log(f"  Unsparsing {p.filename}...")
-                raw_out = os.path.join(stage_dir, f"{p.name}.raw.img")
-                eff_raw = unsparse_image(eff_path, raw_out, cancel_check=cancel_check)
-                eff_path = raw_out
-                eff_fmt = "raw"
-
+            # Patch top-level vbmeta if requested (tiny file, unsparse/decompress only if needed).
             if cfg.vbmeta_mode in ("disable", "enable") and is_top_level_vbmeta(p.name):
                 vb_stage = os.path.join(stage_dir, f"{p.name}.vbmeta.img")
-                if eff_fmt == "zstd":
+                if eff_fmt == "sparse":
+                    eff_raw = unsparse_image(eff_path, vb_stage, cancel_check=cancel_check)
+                    eff_fmt = "raw"
+                elif eff_fmt == "zstd":
                     eff_raw = _run_zstd_decompress(eff_path, vb_stage, zstd_bin, cancel_event)
                     eff_fmt = "raw"
                 else:
@@ -409,10 +486,10 @@ def build_package(
                 log(f"  Keeping {p.name} flags at 0 (chained vbmeta)")
 
             prepared[p.name] = (p, eff_path, eff_fmt, eff_raw)
-            progress(6.0 + (10.0 * idx / len(selected)), f"Prepared {p.name}")
 
-        compress_jobs = []
-        decompress_jobs = []
+        compress_jobs = []    # (p, src, dst, raw_sz, is_sparse)
+        unsparse_jobs = []    # (p, src, dst) for raw-output mode
+        decompress_jobs = []  # (p, src, dst) for raw-output mode
         final_files: Dict[str, Tuple[PartitionImage, str, int]] = {}
 
         # Stream already-ready images directly from source path without redundant temp copies.
@@ -422,38 +499,77 @@ def build_package(
                     final_files[name] = (p, eff_path, eff_raw)
                 else:
                     dst = os.path.join(stage_dir, f"{name}.img.zst")
-                    compress_jobs.append((p, eff_path, dst, eff_raw))
+                    compress_jobs.append((p, eff_path, dst, eff_raw, eff_fmt == "sparse"))
             else:
                 if eff_fmt == "zstd":
                     dst = os.path.join(stage_dir, f"{name}.img")
                     decompress_jobs.append((p, eff_path, dst))
+                elif eff_fmt == "sparse":
+                    dst = os.path.join(stage_dir, f"{name}.img")
+                    unsparse_jobs.append((p, eff_path, dst))
                 else:
                     final_files[name] = (p, eff_path, eff_raw)
 
         total_cpus = os.cpu_count() or 4
 
         if compress_jobs:
-            compress_jobs.sort(key=lambda item: item[3], reverse=True)
-            workers = min(len(compress_jobs), max(1, total_cpus // 2 if total_cpus >= 4 else total_cpus))
-            threads_each = max(1, total_cpus // workers)
-            log(f"Compressing {len(compress_jobs)} image(s) ({workers} worker x {threads_each} threads)...")
+            total_jobs = len(compress_jobs)
+            small_jobs = [j for j in compress_jobs if j[3] < LARGE_IMAGE_BYTES]
+            large_jobs = sorted((j for j in compress_jobs if j[3] >= LARGE_IMAGE_BYTES), key=lambda item: item[3], reverse=True)
+            done = 0
 
-            def _do_comp(job):
-                p, src, dst, raw_sz = job
-                _run_zstd_compress(src, dst, cfg.zstd_level, threads_each, zstd_bin, cancel_event)
+            def _run_batch(batch, workers: int, threads_each: int) -> None:
+                nonlocal done
+                if not batch:
+                    return
+                log(f"Compressing {len(batch)} image(s) ({workers} worker x {threads_each} threads)...")
+
+                def _do_comp(job):
+                    p, src, dst, raw_sz, is_sp = job
+                    if is_sp:
+                        raw_sz = _run_sparse_to_zstd(src, dst, cfg.zstd_level, threads_each, zstd_bin, stage_dir, cancel_event)
+                    else:
+                        _run_zstd_compress(src, dst, cfg.zstd_level, threads_each, zstd_bin, cancel_event)
+                    return p, dst, raw_sz, is_sp
+
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = [ex.submit(_do_comp, job) for job in batch]
+                    for fut in as_completed(futs):
+                        p, dst, raw_sz, is_sp = fut.result()
+                        done += 1
+                        comp_sz = os.path.getsize(dst)
+                        ratio = (comp_sz / raw_sz * 100.0) if raw_sz else 0.0
+                        tag = " [sparse->zstd]" if is_sp else ""
+                        log(f"  {p.name}{tag}: {raw_sz / 1048576:.1f} MB -> {comp_sz / 1048576:.1f} MB ({ratio:.0f}%)")
+                        final_files[p.name] = (p, dst, raw_sz)
+                        progress(12.0 + (52.0 * done / total_jobs), f"Compressed {p.name} ({done}/{total_jobs})")
+
+            # Compress small images in parallel (1 thread each), then saturate cores on large partitions.
+            if small_jobs:
+                _run_batch(small_jobs, min(len(small_jobs), total_cpus), 1)
+            if large_jobs:
+                l_workers = min(len(large_jobs), 2 if total_cpus >= 4 else 1)
+                l_threads = max(1, total_cpus // l_workers)
+                _run_batch(large_jobs, l_workers, l_threads)
+
+        if unsparse_jobs:
+            workers = min(len(unsparse_jobs), max(1, min(4, total_cpus)))
+            log(f"Unsparsing {len(unsparse_jobs)} image(s) ({workers} worker)...")
+
+            def _do_unsparse(job):
+                p, src, dst = job
+                raw_sz = unsparse_image(src, dst, cancel_check=cancel_check)
                 return p, dst, raw_sz
 
             done = 0
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = [ex.submit(_do_comp, job) for job in compress_jobs]
+                futs = [ex.submit(_do_unsparse, job) for job in unsparse_jobs]
                 for fut in as_completed(futs):
                     p, dst, raw_sz = fut.result()
                     done += 1
-                    comp_sz = os.path.getsize(dst)
-                    ratio = (comp_sz / raw_sz * 100.0) if raw_sz else 0.0
-                    log(f"  {p.name}: {raw_sz / 1048576:.1f} MB -> {comp_sz / 1048576:.1f} MB ({ratio:.0f}%)")
+                    log(f"  {p.name}: unsparsed {raw_sz / 1048576:.1f} MB")
                     final_files[p.name] = (p, dst, raw_sz)
-                    progress(16.0 + (48.0 * done / len(compress_jobs)), f"Compressed {p.name} ({done}/{len(compress_jobs)})")
+                    progress(12.0 + (26.0 * done / len(unsparse_jobs)), f"Unsparsed {p.name} ({done}/{len(unsparse_jobs)})")
 
         if decompress_jobs:
             workers = min(len(decompress_jobs), total_cpus)
@@ -472,7 +588,7 @@ def build_package(
                     done += 1
                     log(f"  {p.name}: {raw_sz / 1048576:.1f} MB")
                     final_files[p.name] = (p, dst, raw_sz)
-                    progress(16.0 + (48.0 * done / len(decompress_jobs)), f"Decompressed {p.name} ({done}/{len(decompress_jobs)})")
+                    progress(38.0 + (26.0 * done / len(decompress_jobs)), f"Decompressed {p.name} ({done}/{len(decompress_jobs)})")
 
         check_cancel()
 
@@ -527,7 +643,6 @@ def build_package(
             firmware_specs=fw_specs,
             vbmeta_mode=cfg.vbmeta_mode,
             use_zstd=use_zstd,
-            clean_super=cfg.clean_super,
             super_raw_size=super_raw_size,
         )
         ub_path = os.path.join(stage_dir, "update-binary")
