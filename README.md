@@ -11,7 +11,11 @@ Requires Python 3.8 or newer. No external Python packages are needed.
 - Reads Zstandard uncompressed partition sizes directly from RFC 8878 frame headers in Python (no slow full-file scan).
 - Compresses partitions in parallel with `zstd` (with XXH64 checksums enabled) and stores `.img.zst` entries uncompressed inside the ZIP so archives are never double-compressed.
 - Generates a POSIX `META-INF/com/google/android/update-binary` for custom recovery (TWRP, OrangeFox, PBRP, Lineage Recovery) plus Fastboot scripts for Windows (`flash_windows.bat`), Linux (`flash_linux.sh`), macOS (`flash_macos.sh`), and Android Termux (`flash_termux.sh`).
-- Writes a `META-INF/sha256sums.txt` manifest and verifies archive entries before flashing.
+- Writes a `META-INF/sha256sums.txt` manifest and verifies archive entries before touching any partition.
+- Hardened recovery install order: runs pre-flight checks, dynamically unmounts `/proc/mounts` dm devices, runs `lptools unlimited-group`, checks `lptools free` against required space, and allocates/flashes `super` dynamic partitions before touching `boot`, `vbmeta`, or low-level firmware.
+- Orders ZIP entries so `META-INF/`, scripts, and small boot/firmware images stay below the 4 GiB ZIP64 offset boundary before large dynamic partition images.
+- Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
+- Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Safe (skip bootloader)` in GUI).
 - Supports safe AVB 2.0 flag patching on top-level `vbmeta` only (leaves chained `vbmeta_system` and `vbmeta_vendor` flags at 0 so `libavb` does not reject them).
 - Probes bundled binaries before using them and falls back to system `zstd` / `fastboot` or Python `zstandard` automatically on any CPU or OS.
 
@@ -92,6 +96,7 @@ python main.py \
 Useful flags:
 
 - `--exclude preloader,lk` : skip specific partitions.
+- `--keep-super` : keep unrelated stale partitions inside `super` instead of clearing them.
 - `--no-fastboot` : omit Fastboot scripts and host binaries from the ZIP.
 - `--no-checksum` : omit `META-INF/sha256sums.txt`.
 - `--print-scripts` : print all generated installer scripts without building a ZIP.

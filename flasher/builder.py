@@ -9,7 +9,6 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .avb import is_top_level_vbmeta, patch_vbmeta_flags
@@ -48,6 +47,7 @@ class BuildConfig:
     zip_level: int = 1
     include_fastboot: bool = True
     verify_sha256: bool = True
+    clean_super: bool = True
     partitions: Optional[List[PartitionImage]] = None
 
 
@@ -66,6 +66,7 @@ class BuildResult:
     dynamic_partitions: List[str] = field(default_factory=list)
     bootchain_partitions: List[str] = field(default_factory=list)
     firmware_partitions: List[str] = field(default_factory=list)
+    bootloader_partitions: List[str] = field(default_factory=list)
     super_raw: bool = False
 
     @property
@@ -243,8 +244,10 @@ def preview_scripts(cfg: BuildConfig) -> Dict[str, str]:
     use_zstd = cfg.zstd_level > 0
     dyn_specs = [(p.name, p.raw_size) for p in selected if p.kind == "dynamic"]
     dyn_names = [p.name for p in selected if p.kind == "dynamic"]
+    boot_specs = [(p.name, p.raw_size) for p in selected if p.kind == "bootchain"]
     boot_names = [p.name for p in selected if p.kind == "bootchain"]
-    fw_names = [p.name for p in selected if p.kind == "firmware"]
+    fw_specs = [(p.name, p.raw_size) for p in selected if p.kind in ("firmware", "bootloader")]
+    fw_names = [p.name for p in selected if p.kind in ("firmware", "bootloader")]
     super_raw = any(p.kind == "super_raw" for p in selected)
 
     scripts = {
@@ -255,11 +258,12 @@ def preview_scripts(cfg: BuildConfig) -> Dict[str, str]:
             maintainer=cfg.maintainer,
             dynamic_specs=dyn_specs,
             super_raw=super_raw,
-            bootchain_imgs=boot_names,
-            firmware_imgs=fw_names,
+            bootchain_specs=boot_specs,
+            firmware_specs=fw_specs,
             vbmeta_mode=cfg.vbmeta_mode,
             use_zstd=use_zstd,
             verify_sha256=cfg.verify_sha256,
+            clean_super=cfg.clean_super,
         )
     }
     if cfg.include_fastboot:
@@ -277,6 +281,15 @@ def preview_scripts(cfg: BuildConfig) -> Dict[str, str]:
         scripts["flash_macos.sh"] = generate_macos_fastboot(**fb_kwargs)
         scripts["flash_termux.sh"] = generate_termux_fastboot(**fb_kwargs)
     return scripts
+
+
+def _entry_pack_priority(rel_path: str, size: int) -> Tuple[int, int, str]:
+    """Pack META-INF, scripts, host tools, and small partitions first so they stay below 4 GiB offset."""
+    if rel_path.startswith("META-INF/"):
+        return (0, size, rel_path)
+    if rel_path.startswith("flash_") or rel_path.startswith("bin/"):
+        return (1, size, rel_path)
+    return (2, size, rel_path)
 
 
 def _pack_zip(
@@ -321,6 +334,9 @@ def _pack_zip(
             entries.append((fp, rp, sz, is_exec))
             total_bytes += sz
 
+    # Place metadata, helper binaries, scripts, and small images at low offsets before multi-GB payloads.
+    entries.sort(key=lambda item: _entry_pack_priority(item[1], item[2]))
+
     written_bytes = 0
     default_comp = zipfile.ZIP_STORED if zip_level <= 0 else zipfile.ZIP_DEFLATED
     zip_kwargs = {"compresslevel": min(9, zip_level)} if zip_level > 0 else {}
@@ -337,7 +353,6 @@ def _pack_zip(
             if cancel_event and cancel_event.is_set():
                 raise RuntimeError("Build cancelled")
 
-            # Never double-compress already compressed payloads (.zst, .gz, etc.).
             if zip_level <= 0 or rp.lower().endswith(ALREADY_COMPRESSED_EXTS):
                 comp_type = zipfile.ZIP_STORED
             else:
@@ -404,21 +419,19 @@ def build_package(
 
     output_zip = sanitize_output_path(cfg.output_zip)
     log(f"Target: {cfg.device} ({cfg.codename or 'universal'}) | Version: {cfg.version}")
-    log(f"Selected {len(selected)} partition image(s) | ZSTD level: {cfg.zstd_level} | ZIP level: {cfg.zip_level}")
+    log(f"Selected {len(selected)} image(s) | ZSTD: {cfg.zstd_level} | ZIP: {cfg.zip_level}")
     if zstd_bin:
-        log(f"Using zstd binary: {zstd_bin}")
+        log(f"zstd binary: {zstd_bin}")
     elif use_zstd or any(p.fmt == "zstd" for p in selected):
-        log("Using Python zstandard library fallback")
+        log("Using Python zstandard fallback")
 
     work_dir = tempfile.mkdtemp(prefix="newbies_flasher_work_")
     stage_dir = tempfile.mkdtemp(prefix="newbies_flasher_stage_")
     cancel_check = (lambda: bool(cancel_event and cancel_event.is_set()))
 
     try:
-        # Step 1: Prepare raw inputs (unsparse sparse images, patch top-level vbmeta safely)
         progress(8.0, "Preparing images")
         prepared: Dict[str, Tuple[PartitionImage, str, str, int]] = {}
-        # Maps partition name -> (PartitionImage, effective_path, effective_fmt, effective_raw_size)
 
         for idx, p in enumerate(selected, 1):
             check_cancel()
@@ -426,7 +439,6 @@ def build_package(
             eff_fmt = p.fmt
             eff_raw = p.raw_size
 
-            # Unsparse Android sparse images so recovery always flashes clean raw filesystems
             if eff_fmt == "sparse":
                 log(f"  Unsparsing {p.filename}...")
                 raw_out = os.path.join(stage_dir, f"{p.name}.raw.img")
@@ -434,7 +446,6 @@ def build_package(
                 eff_path = raw_out
                 eff_fmt = "raw"
 
-            # Safe AVB 2.0 patching: only top-level vbmeta (never chained vbmeta_system/vbmeta_vendor)
             if cfg.vbmeta_mode in ("disable", "enable") and is_top_level_vbmeta(p.name):
                 vb_stage = os.path.join(stage_dir, f"{p.name}.vbmeta.img")
                 if eff_fmt == "zstd":
@@ -446,12 +457,11 @@ def build_package(
                     log(f"  Patched top-level vbmeta AVB flags ({cfg.vbmeta_mode})")
                     eff_path = vb_stage
             elif cfg.vbmeta_mode in ("disable", "enable") and p.name.startswith("vbmeta_"):
-                log(f"  Keeping {p.name} flags untouched (chained vbmeta must keep flags=0)")
+                log(f"  Keeping {p.name} flags at 0 (chained vbmeta)")
 
             prepared[p.name] = (p, eff_path, eff_fmt, eff_raw)
             progress(8.0 + (12.0 * idx / len(selected)), f"Prepared {p.name}")
 
-        # Step 2: Parallel compression / decompression / hardlink staging
         compress_jobs = []
         decompress_jobs = []
         final_files: Dict[str, Tuple[PartitionImage, str, int]] = {}
@@ -478,7 +488,7 @@ def build_package(
             compress_jobs.sort(key=lambda item: item[3], reverse=True)
             workers = min(len(compress_jobs), max(1, total_cpus // 2 if total_cpus >= 4 else total_cpus))
             threads_each = max(1, total_cpus // workers)
-            log(f"Compressing {len(compress_jobs)} image(s) with {workers} worker(s) x {threads_each} thread(s)...")
+            log(f"Compressing {len(compress_jobs)} image(s) ({workers} worker x {threads_each} threads)...")
 
             def _do_comp(job):
                 p, src, dst, raw_sz = job
@@ -493,7 +503,7 @@ def build_package(
                     done += 1
                     comp_sz = os.path.getsize(dst)
                     ratio = (comp_sz / raw_sz * 100.0) if raw_sz else 0.0
-                    log(f"  Compressed {p.name}: {raw_sz / 1048576:.1f} MB -> {comp_sz / 1048576:.1f} MB ({ratio:.0f}%)")
+                    log(f"  {p.name}: {raw_sz / 1048576:.1f} MB -> {comp_sz / 1048576:.1f} MB ({ratio:.0f}%)")
                     final_files[p.name] = (p, dst, raw_sz)
                     progress(20.0 + (42.0 * done / len(compress_jobs)), f"Compressed {p.name} ({done}/{len(compress_jobs)})")
 
@@ -512,13 +522,12 @@ def build_package(
                 for fut in as_completed(futs):
                     p, dst, raw_sz = fut.result()
                     done += 1
-                    log(f"  Decompressed {p.name}: {raw_sz / 1048576:.1f} MB")
+                    log(f"  {p.name}: {raw_sz / 1048576:.1f} MB")
                     final_files[p.name] = (p, dst, raw_sz)
                     progress(20.0 + (42.0 * done / len(decompress_jobs)), f"Decompressed {p.name} ({done}/{len(decompress_jobs)})")
 
         check_cancel()
 
-        # Step 3: Build SHA-256 manifest for packaged partition payloads
         if cfg.verify_sha256:
             progress(64.0, "Computing SHA-256 checksums")
             log("Computing SHA-256 checksums...")
@@ -532,12 +541,14 @@ def build_package(
             with open(os.path.join(meta_root, "sha256sums.txt"), "w", encoding="utf-8", newline="\n") as mf:
                 mf.write("\n".join(manifest_lines) + "\n")
 
-        # Step 4: Stage required device/host binaries and write installer scripts
         progress(70.0, "Generating recovery and fastboot scripts")
         dyn_specs: List[Tuple[str, int]] = []
         dyn_names: List[str] = []
+        boot_specs: List[Tuple[str, int]] = []
         boot_names: List[str] = []
+        fw_specs: List[Tuple[str, int]] = []
         fw_names: List[str] = []
+        bl_names: List[str] = []
         super_raw = False
 
         for p in selected:
@@ -548,8 +559,13 @@ def build_package(
             elif p.kind == "super_raw":
                 super_raw = True
             elif p.kind == "bootchain":
+                boot_specs.append((p.name, exact_raw))
                 boot_names.append(p.name)
+            elif p.kind == "bootloader":
+                fw_specs.append((p.name, exact_raw))
+                bl_names.append(p.name)
             else:
+                fw_specs.append((p.name, exact_raw))
                 fw_names.append(p.name)
 
         dev_bins = get_device_binaries()
@@ -577,11 +593,12 @@ def build_package(
             maintainer=cfg.maintainer,
             dynamic_specs=dyn_specs,
             super_raw=super_raw,
-            bootchain_imgs=boot_names,
-            firmware_imgs=fw_names,
+            bootchain_specs=boot_specs,
+            firmware_specs=fw_specs,
             vbmeta_mode=cfg.vbmeta_mode,
             use_zstd=use_zstd,
             verify_sha256=cfg.verify_sha256,
+            clean_super=cfg.clean_super,
         )
         ub_path = os.path.join(meta_android, "update-binary")
         with open(ub_path, "w", encoding="utf-8", newline="\n") as f:
@@ -605,7 +622,7 @@ def build_package(
             fb_kwargs = dict(
                 device=cfg.device,
                 codename=cfg.codename,
-                firmware_imgs=fw_names,
+                firmware_imgs=fw_names + bl_names,
                 bootchain_imgs=boot_names,
                 dynamic_imgs=dyn_names,
                 super_raw=super_raw,
@@ -620,7 +637,6 @@ def build_package(
             with open(os.path.join(work_dir, "flash_termux.sh"), "w", encoding="utf-8", newline="\n") as f:
                 f.write(generate_termux_fastboot(**fb_kwargs))
 
-        # Step 5: Pack final ZIP archive
         progress(75.0, "Packing ZIP archive")
         log(f"Packing {os.path.basename(output_zip)}...")
         _pack_zip(work_dir, output_zip, cfg.zip_level, on_progress=on_progress, cancel_event=cancel_event)
@@ -644,6 +660,7 @@ def build_package(
             dynamic_partitions=dyn_names,
             bootchain_partitions=boot_names,
             firmware_partitions=fw_names,
+            bootloader_partitions=bl_names,
             super_raw=super_raw,
         )
     except Exception:

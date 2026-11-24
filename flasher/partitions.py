@@ -28,14 +28,19 @@ BOOTCHAIN_PARTITIONS = {
     "recovery", "vbmeta", "vbmeta_system", "vbmeta_vendor", "pvmfw",
 }
 
+# Low-level bootloader partitions that can hard-brick a device if interrupted or mismatched.
+BOOTLOADER_PARTITIONS = {
+    "preloader", "preloader_raw", "lk", "lk2", "xbl", "xbl_config",
+    "xbl_ramdump", "abl", "sbl1", "sbl2", "sbl3", "rpm", "tz", "hyp", "uefi",
+}
+
 FIRMWARE_PARTITIONS = {
     "apusys", "cam_vpu1", "cam_vpu2", "cam_vpu3", "ccu", "connsys_bt",
-    "connsys_gnss", "connsys_wifi", "dpm", "gpueb", "gz", "lk", "logo",
-    "mcf_ota", "mcupm", "md1img", "mvpu_algo", "pi_img", "preloader_raw",
-    "preloader", "scp", "spmfw", "sspm", "tee", "tkv", "vcp",
-    "modem", "bluetooth", "dsp", "hyp", "tz", "uefi", "xbl",
-    "xbl_config", "abl", "aop", "devcfg", "featenabler", "imagefv",
-    "keymaster", "qupfw", "shrm", "storsec", "uefisecapp",
+    "connsys_gnss", "connsys_wifi", "dpm", "gpueb", "gz", "logo",
+    "mcf_ota", "mcupm", "md1img", "mvpu_algo", "pi_img",
+    "scp", "spmfw", "sspm", "tee", "tkv", "vcp",
+    "modem", "bluetooth", "dsp", "aop", "devcfg", "featenabler",
+    "imagefv", "keymaster", "qupfw", "shrm", "storsec", "uefisecapp",
 }
 
 _ZSTD_LV_BYTES_RE = re.compile(r"Decompressed Size\s*:\s*.*?\((\d+)\s*B\)", re.IGNORECASE)
@@ -46,7 +51,7 @@ class PartitionImage:
     name: str
     path: str
     filename: str
-    kind: str          # "dynamic", "super_raw", "bootchain", "firmware"
+    kind: str          # "dynamic", "super_raw", "bootchain", "firmware", "bootloader"
     fmt: str           # "raw", "sparse", "zstd"
     file_size: int
     raw_size: int
@@ -74,10 +79,8 @@ def is_raw_filesystem(path: str) -> bool:
         with open(path, "rb") as f:
             f.seek(1024)
             head = f.read(4)
-            # EROFS (0xE0F5E1E2) or F2FS (0xF2F52010) at offset 1024
             if head in (b"\xe2\xe1\xf5\xe0", b"\x10\x20\xf5\xf2"):
                 return True
-            # ext2/ext3/ext4 (0xEF53) at offset 1080
             f.seek(1080)
             if f.read(2) == b"\x53\xef":
                 return True
@@ -147,12 +150,10 @@ def read_zstd_frame_content_size(path: str) -> Optional[int]:
 
 
 def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None) -> int:
-    # Fast path: pure-Python RFC 8878 frame header parse (zero subprocess overhead)
     hdr_size = read_zstd_frame_content_size(path)
     if hdr_size is not None and hdr_size > 0:
         return hdr_size
 
-    # Fallback 1: zstd -lv exact byte report (supports multi-frame files)
     z_bin = zstd_bin or get_host_zstd()
     if z_bin:
         try:
@@ -172,7 +173,6 @@ def get_zstd_uncompressed_size(path: str, zstd_bin: Optional[str] = None) -> int
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
 
-    # Fallback 2: stream length via python zstandard if installed
     try:
         import zstandard
         dctx = zstandard.ZstdDecompressor()
@@ -214,6 +214,8 @@ def classify_partition(name: str, path: str, fmt: str) -> str:
         return "dynamic"
     if n in BOOTCHAIN_PARTITIONS:
         return "bootchain"
+    if n in BOOTLOADER_PARTITIONS:
+        return "bootloader"
     if n in FIRMWARE_PARTITIONS:
         return "firmware"
     if fmt == "raw" and is_raw_filesystem(path):
@@ -228,7 +230,6 @@ def scan_partitions(directory: str, zstd_bin: Optional[str] = None) -> List[Part
         return []
 
     found: Dict[str, PartitionImage] = {}
-    # Prefer top-level files over nested subdirectories if duplicate names exist.
     walk_entries = []
     for root, dirs, files in os.walk(directory):
         dirs.sort()
@@ -272,7 +273,7 @@ def scan_partitions(directory: str, zstd_bin: Optional[str] = None) -> List[Part
             selected=True,
         )
 
-    order = {"super_raw": 0, "dynamic": 1, "bootchain": 2, "firmware": 3}
+    order = {"super_raw": 0, "dynamic": 1, "bootchain": 2, "firmware": 3, "bootloader": 4}
     return sorted(found.values(), key=lambda p: (order.get(p.kind, 9), p.name))
 
 

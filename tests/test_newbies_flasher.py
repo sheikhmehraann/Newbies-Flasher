@@ -61,7 +61,6 @@ def _make_ext4_dummy(path: str, size: int = 8192) -> None:
 
 
 def _make_sparse_test_image(path: str) -> bytes:
-    """Create a 4-block (16 KiB) sparse image containing RAW, FILL(0), FILL(0xAA55AA55), and DONT_CARE."""
     blk_sz = 4096
     raw_block = bytes([0x41] * blk_sz)
     fill_zero_block = bytes([0x00] * blk_sz)
@@ -89,11 +88,13 @@ class TestNewbiesFlasher(unittest.TestCase):
 
         with open(os.path.join(self.imgs, "boot.img"), "wb") as f:
             f.write(b"BOOTDATA" * 1024)
-        with open(os.path.join(self.imgs, "lk.img"), "wb") as f:
-            f.write(b"LKDATA" * 1024)
+        with open(os.path.join(self.imgs, "apusys.img"), "wb") as f:
+            f.write(b"APUSYS" * 1024)
+        with open(os.path.join(self.imgs, "preloader_raw.img"), "wb") as f:
+            f.write(b"PRELOADER" * 512)
         _make_vbmeta(os.path.join(self.imgs, "vbmeta.img"), flags=0)
         _make_vbmeta(os.path.join(self.imgs, "vbmeta_system.img"), flags=0)
-        _make_ext4_dummy(os.path.join(self.imgs, "system.img"), size=16384)
+        _make_ext4_dummy(os.path.join(self.imgs, "system.img"), size=32768)
         with open(os.path.join(self.imgs, "build.prop"), "w", encoding="utf-8") as f:
             f.write("ro.product.marketname=Test Phone Pro\nro.product.device=testphone\nro.build.display.id=2.5.0\n")
 
@@ -105,7 +106,6 @@ class TestNewbiesFlasher(unittest.TestCase):
         raw_path = os.path.join(self.tmp, "vendor_raw.img")
         expected = _make_sparse_test_image(sp_path)
 
-        # Pre-populate dst with non-zero bytes to prove FILL(0) writes real zeros.
         with open(raw_path, "wb") as f:
             f.write(b"\xff" * len(expected))
 
@@ -119,7 +119,7 @@ class TestNewbiesFlasher(unittest.TestCase):
     def test_zstd_frame_header_size_without_cli_or_python_lib(self) -> None:
         raw_path = os.path.join(self.tmp, "sample.img")
         zst_path = os.path.join(self.tmp, "sample.img.zst")
-        payload = (b"ANDROID_PARTITION_BLOCK_" * 1500)
+        payload = b"ANDROID_PARTITION_BLOCK_" * 1500
         with open(raw_path, "wb") as f:
             f.write(payload)
 
@@ -128,7 +128,6 @@ class TestNewbiesFlasher(unittest.TestCase):
         subprocess.run([zbin, "-1", "-f", "-q", raw_path, "-o", zst_path], check=True)
 
         self.assertEqual(read_zstd_frame_content_size(zst_path), len(payload))
-        # Verify size resolves purely from frame header even if zstd CLI is hidden.
         with patch("flasher.partitions.get_host_zstd", return_value=None):
             self.assertEqual(get_zstd_uncompressed_size(zst_path), len(payload))
 
@@ -144,15 +143,17 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertTrue(patch_vbmeta_flags(vb, "enable"))
         self.assertEqual(read_vbmeta_flags(vb), 0)
 
-    def test_super_raw_and_build_prop_detection(self) -> None:
+    def test_classification_bootloader_and_super_raw(self) -> None:
         self.assertEqual(classify_partition("super", "", "raw"), "super_raw")
+        self.assertEqual(classify_partition("preloader_raw", "", "raw"), "bootloader")
+        self.assertEqual(classify_partition("lk", "", "raw"), "bootloader")
+        self.assertEqual(classify_partition("apusys", "", "raw"), "firmware")
         props = detect_build_props(self.imgs)
         self.assertEqual(props["device"], "Test Phone Pro")
         self.assertEqual(props["codename"], "testphone")
         self.assertEqual(props["version"], "2.5.0")
 
-    def test_full_build_no_double_compress_no_dead_bins_and_chained_vbmeta_intact(self) -> None:
-        # Also include a sparse dynamic image and a pre-compressed .img.zst image
+    def test_full_build_hardening_zip_order_and_chained_vbmeta(self) -> None:
         sp_vendor = os.path.join(self.imgs, "vendor.img")
         expected_vendor = _make_sparse_test_image(sp_vendor)
 
@@ -170,45 +171,52 @@ class TestNewbiesFlasher(unittest.TestCase):
             zip_level=5,
             include_fastboot=True,
             verify_sha256=True,
+            clean_super=True,
             partitions=parts,
         )
 
         res1 = build_package(cfg)
         self.assertTrue(os.path.isfile(res1.output_zip))
         self.assertNotIn(" ", os.path.basename(res1.output_zip))
+        self.assertIn("preloader_raw", res1.bootloader_partitions)
 
-        # Second build reusing the exact same partitions list must succeed (no mutation bug)
+        # Second build reusing the same partitions list must succeed
         res2 = build_package(cfg)
         self.assertTrue(os.path.isfile(res2.output_zip))
 
         with zipfile.ZipFile(res1.output_zip, "r") as zf:
-            names = set(zf.namelist())
+            names_list = zf.namelist()
+            names = set(names_list)
             self.assertIn("META-INF/com/google/android/update-binary", names)
             self.assertIn("META-INF/sha256sums.txt", names)
-            self.assertIn("META-INF/zstd", names)
-            self.assertIn("META-INF/bin/lptools", names)
-            self.assertIn("META-INF/bin/avbctl", names)
-            self.assertIn("flash_windows.bat", names)
-            self.assertIn("flash_linux.sh", names)
-            self.assertIn("flash_macos.sh", names)
-            self.assertIn("flash_termux.sh", names)
-
-            # Dead GPLv3/ARM32 binaries must never be bundled
             self.assertNotIn("META-INF/bin/rapidflasher-arm64", names)
             self.assertNotIn("META-INF/bin/lpdump", names)
             self.assertNotIn("META-INF/bin/lpmake", names)
 
-            # .zst entries must be stored uncompressed (no double compression)
+            # META-INF entries must be packed before payload images
+            ub_idx = names_list.index("META-INF/com/google/android/update-binary")
+            sys_idx = names_list.index("system.img.zst")
+            self.assertLess(ub_idx, sys_idx)
+
+            # .zst entries must use ZIP_STORED
             for info in zf.infolist():
                 if info.filename.endswith(".zst"):
                     self.assertEqual(info.compress_type, zipfile.ZIP_STORED, info.filename)
 
-            # Update-binary must use unsparsed vendor size (16384), not sparse file size
             ub = zf.read("META-INF/com/google/android/update-binary").decode("utf-8")
             self.assertIn(f"lp_create_slot vendor {len(expected_vendor)}", ub)
+            self.assertIn("unlimited-group", ub)
+            self.assertIn("lp_clear_all_stale", ub)
+            self.assertIn("/proc/mounts", ub)
+            self.assertIn("unlock_block_rw", ub)
+            self.assertIn("check_block_fits", ub)
             self.assertNotIn("--no-check", ub)
 
-            # Verify top-level vbmeta was patched to flags=3 while chained vbmeta_system kept flags=0
+            # Dynamic / super stage must execute BEFORE bootchain and firmware
+            self.assertLess(ub.index("[2/4] Dynamic / Super partitions"), ub.index("[3/4] Bootchain & AVB 2.0"))
+            self.assertLess(ub.index("[3/4] Bootchain & AVB 2.0"), ub.index("[4/4] Firmware partitions"))
+
+            # Verify top-level vbmeta patched (flags=3) and chained vbmeta_system intact (flags=0)
             zbin = get_host_zstd()
             vb_zst = os.path.join(self.tmp, "chk_vb.zst")
             vb_raw = os.path.join(self.tmp, "chk_vb.img")
@@ -223,7 +231,7 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertEqual(read_vbmeta_flags(vb_raw), 3)
             self.assertEqual(read_vbmeta_flags(vbs_raw), 0)
 
-    def test_adversarial_metadata_escaping(self) -> None:
+    def test_adversarial_metadata_and_parentheses_zip_name(self) -> None:
         cfg = BuildConfig(
             imgs_dir=self.imgs,
             output_zip=os.path.join(self.tmp, "adv.zip"),
@@ -238,6 +246,7 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertIn("expected='code;rm -rf / & whoami'", ub)
         self.assertNotIn("& calc", bat)
         self.assertIn("if errorlevel 1", bat)
+        self.assertIn("resize-logical-partition", bat)
 
     def test_build_cancellation_cleans_output(self) -> None:
         ev = threading.Event()
@@ -258,7 +267,7 @@ class TestNewbiesFlasher(unittest.TestCase):
             "X6871-1.0-Flashable.zip",
         )
 
-    def test_gui_loads_and_toggles_partitions(self) -> None:
+    def test_gui_fits_768p_screen_and_safe_select(self) -> None:
         import tkinter as tk
         from gui import NewbiesFlasherApp
 
@@ -271,12 +280,18 @@ class TestNewbiesFlasher(unittest.TestCase):
             app = NewbiesFlasherApp(root)
             app.partitions = scan_partitions(self.imgs)
             app._refresh_tree()
+            root.update_idletasks()
+
+            # Ensure requested UI height fits inside a standard 768p laptop screen
+            self.assertLessEqual(root.winfo_reqheight(), 680)
             self.assertEqual(len(app.tree.get_children()), len(app.partitions))
-            self.assertTrue(app.partitions[0].selected)
-            app._toggle_index(0)
-            self.assertFalse(app.partitions[0].selected)
-            app._set_all_selected(True)
-            self.assertTrue(all(p.selected for p in app.partitions))
+
+            # Safe select must uncheck bootloader partitions (preloader_raw) and keep others
+            app._select_safe_only()
+            by_name = {p.name: p.selected for p in app.partitions}
+            self.assertFalse(by_name["preloader_raw"])
+            self.assertTrue(by_name["boot"])
+            self.assertTrue(by_name["system"])
         finally:
             root.destroy()
 

@@ -47,6 +47,7 @@ def print_summary(res: BuildResult) -> None:
         len(res.dynamic_partitions)
         + len(res.bootchain_partitions)
         + len(res.firmware_partitions)
+        + len(res.bootloader_partitions)
         + (1 if res.super_raw else 0)
     )
     print(f"Partitions   : {total}")
@@ -58,6 +59,8 @@ def print_summary(res: BuildResult) -> None:
         print(f"  - Boot     : {len(res.bootchain_partitions)} ({', '.join(res.bootchain_partitions)})")
     if res.firmware_partitions:
         print(f"  - Firmware : {len(res.firmware_partitions)} ({', '.join(res.firmware_partitions)})")
+    if res.bootloader_partitions:
+        print(f"  - Bootldr  : {len(res.bootloader_partitions)} ({', '.join(res.bootloader_partitions)})")
     print("-" * 72)
     print(f"Output File  : {res.output_zip}")
     print(f"Size         : {res.size_mb:.2f} MB")
@@ -295,6 +298,7 @@ def cli_flow() -> None:
     parser.add_argument("--exclude", default="", help="Comma-separated partition names to skip")
     parser.add_argument("--no-fastboot", action="store_true", help="Build recovery-only ZIP without fastboot installers")
     parser.add_argument("--no-checksum", action="store_true", help="Skip generating SHA-256 verification manifest")
+    parser.add_argument("--keep-super", action="store_true", help="Do not clear unrelated stale partitions in super")
     parser.add_argument("--print-scripts", action="store_true", help="Print generated scripts and exit without building")
     parser.add_argument("--gui", action="store_true", help="Launch desktop GUI")
 
@@ -337,6 +341,7 @@ def cli_flow() -> None:
         zip_level=args.zip_level,
         include_fastboot=not args.no_fastboot,
         verify_sha256=not args.no_checksum,
+        clean_super=not args.keep_super,
         partitions=parts,
     )
 

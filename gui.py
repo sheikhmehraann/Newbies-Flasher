@@ -49,9 +49,9 @@ def _apply_windows_dark_chrome(window: tk.Tk) -> None:
         hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
         c_int = ctypes.c_int
         dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
-        dwm(hwnd, 20, ctypes.byref(c_int(1)), ctypes.sizeof(c_int))       # dark titlebar
-        dwm(hwnd, 33, ctypes.byref(c_int(2)), ctypes.sizeof(c_int))       # rounded corners
-        dwm(hwnd, 35, ctypes.byref(c_int(0x001E1A18)), ctypes.sizeof(c_int))  # caption BGR
+        dwm(hwnd, 20, ctypes.byref(c_int(1)), ctypes.sizeof(c_int))
+        dwm(hwnd, 33, ctypes.byref(c_int(2)), ctypes.sizeof(c_int))
+        dwm(hwnd, 35, ctypes.byref(c_int(0x001A1614)), ctypes.sizeof(c_int))
     except Exception:
         pass
 
@@ -67,25 +67,34 @@ def _fmt_size(num_bytes: int) -> str:
 
 
 class NewbiesFlasherApp:
-    BG = "#14161a"
-    SURFACE = "#1c1f26"
-    BORDER = "#2c313c"
-    INPUT = "#111318"
-    TEXT = "#edf0f5"
-    MUTED = "#9098a8"
-    ACCENT = "#2b7de9"
-    ACCENT_HOVER = "#3d8cf2"
-    DANGER = "#c94a4a"
-    DANGER_HOVER = "#dc5c5c"
-    OK = "#3fb97c"
+    BG = "#121418"
+    SURFACE = "#1a1d24"
+    SURFACE_ALT = "#212630"
+    BORDER = "#2b313d"
+    INPUT = "#101216"
+    TEXT = "#edf1f7"
+    MUTED = "#8c96a8"
+    ACCENT = "#2575e6"
+    ACCENT_HOVER = "#3988f5"
+    DANGER = "#c44545"
+    DANGER_HOVER = "#d85757"
+    OK = "#38b377"
     WARN = "#e0a538"
-    CONSOLE = "#0e1014"
+    CONSOLE = "#0d0f13"
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"Newbies Flasher v{__version__}")
-        self.root.geometry("1040x820")
-        self.root.minsize(880, 680)
+
+        # Fit cleanly inside any display, including 1360x768 and 1280x720 laptops.
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        win_w = min(1120, max(860, sw - 80))
+        win_h = min(650, max(540, sh - 100))
+        pos_x = max(0, (sw - win_w) // 2)
+        pos_y = max(0, (sh - win_h) // 2 - 16)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.minsize(840, 520)
         self.root.configure(bg=self.BG)
         _apply_windows_dark_chrome(self.root)
 
@@ -115,20 +124,21 @@ class NewbiesFlasherApp:
             foreground=self.TEXT,
             fieldbackground=self.INPUT,
             bordercolor=self.BORDER,
-            rowheight=25,
+            rowheight=24,
             font=(self.ui_font, 9),
         )
         style.configure(
             "NF.Treeview.Heading",
-            background=self.SURFACE,
+            background=self.SURFACE_ALT,
             foreground=self.MUTED,
             bordercolor=self.BORDER,
             relief="flat",
-            font=(self.ui_font, 9, "bold"),
+            padding=(6, 4),
+            font=(self.ui_font, 8, "bold"),
         )
         style.map(
             "NF.Treeview",
-            background=[("selected", "#26334a")],
+            background=[("selected", "#243550")],
             foreground=[("selected", self.TEXT)],
         )
         style.configure(
@@ -138,12 +148,12 @@ class NewbiesFlasherApp:
             bordercolor=self.BORDER,
             lightcolor=self.ACCENT,
             darkcolor=self.ACCENT,
-            thickness=8,
+            thickness=7,
         )
         style.configure(
             "NF.TCombobox",
             fieldbackground=self.INPUT,
-            background=self.SURFACE,
+            background=self.SURFACE_ALT,
             foreground=self.TEXT,
             arrowcolor=self.TEXT,
             bordercolor=self.BORDER,
@@ -152,7 +162,7 @@ class NewbiesFlasherApp:
         style.map(
             "NF.TCombobox",
             fieldbackground=[("readonly", self.INPUT)],
-            selectbackground=[("readonly", self.SURFACE)],
+            selectbackground=[("readonly", self.SURFACE_ALT)],
             selectforeground=[("readonly", self.TEXT)],
         )
         style.configure(
@@ -164,59 +174,58 @@ class NewbiesFlasherApp:
 
     def _build_layout(self) -> None:
         outer = tk.Frame(self.root, bg=self.BG)
-        outer.pack(fill=tk.BOTH, expand=True, padx=18, pady=14)
+        outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
 
-        # Header
-        header = tk.Frame(outer, bg=self.BG)
-        header.pack(fill=tk.X, pady=(0, 10))
+        # Top Bar
+        top = tk.Frame(outer, bg=self.BG)
+        top.pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(
-            header,
-            text="Newbies Flasher",
-            font=(self.ui_font, 17, "bold"),
-            fg=self.TEXT,
-            bg=self.BG,
+            top, text="Newbies Flasher", font=(self.ui_font, 15, "bold"),
+            fg=self.TEXT, bg=self.BG,
         ).pack(side=tk.LEFT)
 
         tk.Label(
-            header,
-            text="Android Recovery & Fastboot Package Maker",
-            font=(self.ui_font, 10),
-            fg=self.MUTED,
-            bg=self.BG,
-        ).pack(side=tk.LEFT, padx=(12, 0), pady=(4, 0))
+            top, text=f"v{__version__}", font=(self.ui_font, 9),
+            fg=self.MUTED, bg=self.BG,
+        ).pack(side=tk.LEFT, padx=(6, 12), pady=(4, 0))
 
         zstd_status = "zstd: ready" if get_host_zstd() else ("zstd: python" if has_python_zstandard() else "zstd: missing")
-        env_text = f"{detect_host_os()}  |  {zstd_status}"
         tk.Label(
-            header,
-            text=env_text,
-            font=(self.ui_font, 9),
+            top,
+            text=f"{detect_host_os()} | {zstd_status}",
+            font=(self.ui_font, 8, "bold"),
             fg=self.OK if "missing" not in zstd_status else self.WARN,
             bg=self.SURFACE,
-            padx=10,
-            pady=4,
-        ).pack(side=tk.RIGHT)
+            padx=8,
+            pady=3,
+        ).pack(side=tk.LEFT, pady=(2, 0))
 
-        # Section 1: Folder picker + Partition selector table
-        src_card = tk.Frame(outer, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=12, pady=10)
-        src_card.pack(fill=tk.BOTH, expand=False, pady=(0, 10))
+        self._btn(top, "Open Output", self._open_output, bg=self.SURFACE_ALT, hover="#2e3543", pad=(10, 4), size=9).pack(side=tk.RIGHT)
+        self._btn(top, "Preview Scripts", self._open_script_preview, bg=self.SURFACE_ALT, hover="#2e3543", pad=(10, 4), size=9).pack(side=tk.RIGHT, padx=(0, 6))
 
-        src_top = tk.Frame(src_card, bg=self.SURFACE)
-        src_top.pack(fill=tk.X)
+        # Main Two-Pane Workspace
+        main_pane = tk.Frame(outer, bg=self.BG)
+        main_pane.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        tk.Label(src_top, text="1. Partition Images", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(side=tk.LEFT)
-        self.scan_lbl = tk.Label(src_top, text="Choose a folder containing .img or .img.zst files", font=(self.ui_font, 9), fg=self.MUTED, bg=self.SURFACE)
+        # Left Pane: Folder picker + Partition checklist
+        left_card = tk.Frame(main_pane, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=10, pady=8)
+        left_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        left_head = tk.Frame(left_card, bg=self.SURFACE)
+        left_head.pack(fill=tk.X)
+        tk.Label(left_head, text="Partition Images", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(side=tk.LEFT)
+        self.scan_lbl = tk.Label(left_head, text="Select a folder with .img / .img.zst files", font=(self.ui_font, 8), fg=self.MUTED, bg=self.SURFACE)
         self.scan_lbl.pack(side=tk.RIGHT)
 
-        path_row = tk.Frame(src_card, bg=self.SURFACE)
-        path_row.pack(fill=tk.X, pady=(6, 8))
+        path_row = tk.Frame(left_card, bg=self.SURFACE)
+        path_row.pack(fill=tk.X, pady=(6, 6))
 
         self.path_var = tk.StringVar()
         self.path_entry = tk.Entry(
             path_row,
             textvariable=self.path_var,
-            font=(self.ui_font, 10),
+            font=(self.ui_font, 9),
             bg=self.INPUT,
             fg=self.TEXT,
             insertbackground=self.TEXT,
@@ -225,176 +234,182 @@ class NewbiesFlasherApp:
             highlightbackground=self.BORDER,
             highlightcolor=self.ACCENT,
         )
-        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0, 8))
+        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 6))
         self.path_entry.bind("<KeyRelease>", self._schedule_scan)
 
-        self._btn(path_row, "Browse...", self._browse_folder, bg="#282d38", hover="#343b4a").pack(side=tk.LEFT, padx=(0, 6))
-        self._btn(path_row, "Rescan", self._trigger_scan_now, bg="#282d38", hover="#343b4a").pack(side=tk.LEFT)
+        self._btn(path_row, "Browse...", self._browse_folder, bg=self.SURFACE_ALT, hover="#2e3543", pad=(10, 3), size=9).pack(side=tk.LEFT, padx=(0, 4))
+        self._btn(path_row, "Rescan", self._trigger_scan_now, bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 3), size=9).pack(side=tk.LEFT)
 
-        # Partition Treeview
-        tree_wrap = tk.Frame(src_card, bg=self.SURFACE)
-        tree_wrap.pack(fill=tk.X)
+        tree_wrap = tk.Frame(left_card, bg=self.SURFACE)
+        tree_wrap.pack(fill=tk.BOTH, expand=True)
 
         cols = ("use", "name", "kind", "fmt", "raw", "disk")
-        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=6, style="NF.Treeview", selectmode="browse")
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=9, style="NF.Treeview", selectmode="browse")
         self.tree.heading("use", text="Use")
         self.tree.heading("name", text="Partition")
         self.tree.heading("kind", text="Type")
-        self.tree.heading("fmt", text="Format")
-        self.tree.heading("raw", text="Raw Size")
-        self.tree.heading("disk", text="File Size")
+        self.tree.heading("fmt", text="Fmt")
+        self.tree.heading("raw", text="Raw")
+        self.tree.heading("disk", text="File")
 
-        self.tree.column("use", width=52, anchor=tk.CENTER, stretch=False)
-        self.tree.column("name", width=220, anchor=tk.W)
-        self.tree.column("kind", width=110, anchor=tk.CENTER)
-        self.tree.column("fmt", width=85, anchor=tk.CENTER)
-        self.tree.column("raw", width=120, anchor=tk.E)
-        self.tree.column("disk", width=120, anchor=tk.E)
+        self.tree.column("use", width=44, anchor=tk.CENTER, stretch=False)
+        self.tree.column("name", width=165, anchor=tk.W)
+        self.tree.column("kind", width=82, anchor=tk.CENTER, stretch=False)
+        self.tree.column("fmt", width=58, anchor=tk.CENTER, stretch=False)
+        self.tree.column("raw", width=80, anchor=tk.E, stretch=False)
+        self.tree.column("disk", width=80, anchor=tk.E, stretch=False)
 
-        tree_scroll = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.tag_configure("bootloader", foreground=self.WARN)
+        self.tree.tag_configure("unchecked", foreground="#5d6678")
+
+        tscroll = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tscroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
         self.tree.bind("<space>", self._on_tree_space)
 
-        sel_bar = tk.Frame(src_card, bg=self.SURFACE)
+        sel_bar = tk.Frame(left_card, bg=self.SURFACE)
         sel_bar.pack(fill=tk.X, pady=(6, 0))
 
-        self._btn(sel_bar, "Select All", lambda: self._set_all_selected(True), bg="#252a34", hover="#313846", pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 6))
-        self._btn(sel_bar, "Select None", lambda: self._set_all_selected(False), bg="#252a34", hover="#313846", pad=(8, 2), size=8).pack(side=tk.LEFT)
-        self.sel_summary_lbl = tk.Label(sel_bar, text="Selected: 0 / 0", font=(self.ui_font, 9), fg=self.MUTED, bg=self.SURFACE)
+        self._btn(sel_bar, "All", lambda: self._set_all_selected(True), bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 4))
+        self._btn(sel_bar, "None", lambda: self._set_all_selected(False), bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 2), size=8).pack(side=tk.LEFT, padx=(0, 4))
+        self._btn(sel_bar, "Safe (skip bootloader)", self._select_safe_only, bg=self.SURFACE_ALT, hover="#2e3543", pad=(8, 2), size=8).pack(side=tk.LEFT)
+        self.sel_summary_lbl = tk.Label(sel_bar, text="Selected: 0 / 0", font=(self.ui_font, 8), fg=self.MUTED, bg=self.SURFACE)
         self.sel_summary_lbl.pack(side=tk.RIGHT)
 
-        # Section 2: Package metadata & build options
-        cfg_card = tk.Frame(outer, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=12, pady=10)
-        cfg_card.pack(fill=tk.X, pady=(0, 10))
+        # Right Pane: Compact ROM metadata, options, and primary Build CTA
+        right_card = tk.Frame(main_pane, bg=self.SURFACE, highlightthickness=1, highlightbackground=self.BORDER, padx=12, pady=8, width=370)
+        right_card.pack(side=tk.RIGHT, fill=tk.Y)
+        right_card.pack_propagate(False)
 
-        tk.Label(cfg_card, text="2. ROM Info & Build Options", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(anchor=tk.W, pady=(0, 6))
+        tk.Label(right_card, text="ROM Info & Options", font=(self.ui_font, 10, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(anchor=tk.W, pady=(0, 6))
 
-        cols_frame = tk.Frame(cfg_card, bg=self.SURFACE)
-        cols_frame.pack(fill=tk.X)
-
-        left = tk.Frame(cols_frame, bg=self.SURFACE)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 14))
-
-        right = tk.Frame(cols_frame, bg=self.SURFACE)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(14, 0))
+        meta_grid = tk.Frame(right_card, bg=self.SURFACE)
+        meta_grid.pack(fill=tk.X, pady=(0, 6))
+        meta_grid.columnconfigure(0, weight=1)
+        meta_grid.columnconfigure(1, weight=1)
 
         self.device_var = tk.StringVar(value="Android Device")
         self.codename_var = tk.StringVar(value="")
         self.version_var = tk.StringVar(value="1.0")
         self.maintainer_var = tk.StringVar(value="User")
 
-        self._labeled_entry(left, "Device Name", self.device_var)
-        self._labeled_entry(left, "Codename (optional, checked on flash)", self.codename_var)
-        self._labeled_entry(left, "ROM Version", self.version_var)
-        self._labeled_entry(left, "Maintainer", self.maintainer_var)
+        self._grid_entry(meta_grid, 0, 0, "Device Name", self.device_var, pad_right=6)
+        self._grid_entry(meta_grid, 0, 1, "Codename", self.codename_var, pad_right=0)
+        self._grid_entry(meta_grid, 2, 0, "Version", self.version_var, pad_right=6)
+        self._grid_entry(meta_grid, 2, 1, "Maintainer", self.maintainer_var, pad_right=0)
 
-        tk.Label(right, text="AVB 2.0 (top-level vbmeta)", font=(self.ui_font, 9, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(anchor=tk.W)
+        tk.Label(right_card, text="AVB 2.0 (top-level vbmeta)", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(anchor=tk.W, pady=(2, 1))
         self.vbmeta_var = tk.StringVar(value="skip")
         ttk.Combobox(
-            right,
+            right_card,
             textvariable=self.vbmeta_var,
             values=("skip", "disable", "enable"),
             state="readonly",
             style="NF.TCombobox",
-        ).pack(fill=tk.X, pady=(2, 8))
+        ).pack(fill=tk.X, pady=(0, 6))
 
-        z_head = tk.Frame(right, bg=self.SURFACE)
+        z_head = tk.Frame(right_card, bg=self.SURFACE)
         z_head.pack(fill=tk.X)
-        tk.Label(z_head, text="ZSTD Compression", font=(self.ui_font, 9, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(side=tk.LEFT)
-        self.zstd_lbl = tk.Label(z_head, text="Level 1 (Fast)", font=(self.ui_font, 9), fg=self.ACCENT_HOVER, bg=self.SURFACE)
+        tk.Label(z_head, text="ZSTD Compression", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
+        self.zstd_lbl = tk.Label(z_head, text="Level 1 (Fast)", font=(self.ui_font, 8, "bold"), fg=self.ACCENT_HOVER, bg=self.SURFACE)
         self.zstd_lbl.pack(side=tk.RIGHT)
 
         self.zstd_var = tk.IntVar(value=1)
         ttk.Scale(
-            right, from_=0, to=22, orient=tk.HORIZONTAL,
+            right_card, from_=0, to=22, orient=tk.HORIZONTAL,
             variable=self.zstd_var, command=self._on_zstd_change, style="NF.Horizontal.TScale",
-        ).pack(fill=tk.X, pady=(2, 8))
+        ).pack(fill=tk.X, pady=(1, 6))
 
-        p_head = tk.Frame(right, bg=self.SURFACE)
+        p_head = tk.Frame(right_card, bg=self.SURFACE)
         p_head.pack(fill=tk.X)
-        tk.Label(p_head, text="ZIP Level (raw files only; .zst stored)", font=(self.ui_font, 9, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(side=tk.LEFT)
-        self.zip_lbl = tk.Label(p_head, text="Level 1 (Fast)", font=(self.ui_font, 9), fg=self.ACCENT_HOVER, bg=self.SURFACE)
+        tk.Label(p_head, text="ZIP Level (raw only)", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
+        self.zip_lbl = tk.Label(p_head, text="Level 1 (Fast)", font=(self.ui_font, 8, "bold"), fg=self.ACCENT_HOVER, bg=self.SURFACE)
         self.zip_lbl.pack(side=tk.RIGHT)
 
         self.zip_var = tk.IntVar(value=1)
         ttk.Scale(
-            right, from_=0, to=9, orient=tk.HORIZONTAL,
+            right_card, from_=0, to=9, orient=tk.HORIZONTAL,
             variable=self.zip_var, command=self._on_zip_change, style="NF.Horizontal.TScale",
-        ).pack(fill=tk.X, pady=(2, 8))
-
-        opts_row = tk.Frame(right, bg=self.SURFACE)
-        opts_row.pack(fill=tk.X, pady=(2, 0))
+        ).pack(fill=tk.X, pady=(1, 6))
 
         self.fastboot_var = tk.BooleanVar(value=True)
         self.sha256_var = tk.BooleanVar(value=True)
+        self.clean_super_var = tk.BooleanVar(value=True)
 
-        tk.Checkbutton(
-            opts_row, text="Include Fastboot installers", variable=self.fastboot_var,
-            bg=self.SURFACE, fg=self.TEXT, selectcolor=self.INPUT,
-            activebackground=self.SURFACE, activeforeground=self.TEXT, font=(self.ui_font, 9),
-        ).pack(side=tk.LEFT, padx=(0, 14))
+        for text, var in (
+            ("Include Fastboot scripts (Win/Linux/Mac/Termux)", self.fastboot_var),
+            ("Verify SHA-256 checksums before flashing", self.sha256_var),
+            ("Clean stale dynamic partitions in super", self.clean_super_var),
+        ):
+            tk.Checkbutton(
+                right_card,
+                text=text,
+                variable=var,
+                bg=self.SURFACE,
+                fg=self.TEXT,
+                selectcolor=self.INPUT,
+                activebackground=self.SURFACE,
+                activeforeground=self.TEXT,
+                font=(self.ui_font, 8),
+                anchor=tk.W,
+            ).pack(fill=tk.X, pady=1)
 
-        tk.Checkbutton(
-            opts_row, text="SHA-256 verification", variable=self.sha256_var,
-            bg=self.SURFACE, fg=self.TEXT, selectcolor=self.INPUT,
-            activebackground=self.SURFACE, activeforeground=self.TEXT, font=(self.ui_font, 9),
-        ).pack(side=tk.LEFT)
+        cta_row = tk.Frame(right_card, bg=self.SURFACE)
+        cta_row.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
 
-        # Section 3: Action bar + deterministic progress
-        action_bar = tk.Frame(outer, bg=self.BG)
-        action_bar.pack(fill=tk.X, pady=(0, 8))
+        self.build_btn = self._btn(cta_row, "Build Flashable ZIP", self._start_build, bg=self.ACCENT, hover=self.ACCENT_HOVER, pad=(12, 8), size=10, bold=True)
+        self.build_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-        self.build_btn = self._btn(action_bar, "Build Flashable ZIP", self._start_build, bg=self.ACCENT, hover=self.ACCENT_HOVER, pad=(18, 7), bold=True)
-        self.build_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.cancel_btn = self._btn(action_bar, "Cancel", self._cancel_build, bg=self.DANGER, hover=self.DANGER_HOVER, pad=(12, 7))
+        self.cancel_btn = self._btn(cta_row, "Cancel", self._cancel_build, bg=self.DANGER, hover=self.DANGER_HOVER, pad=(10, 8), size=9)
         self.cancel_btn.config(state=tk.DISABLED)
-        self.cancel_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.cancel_btn.pack(side=tk.RIGHT)
 
-        self._btn(action_bar, "Preview Scripts", self._open_script_preview, bg="#282d38", hover="#343b4a", pad=(12, 7)).pack(side=tk.LEFT, padx=(0, 8))
-        self._btn(action_bar, "Open Output Folder", self._open_output, bg="#282d38", hover="#343b4a", pad=(12, 7)).pack(side=tk.LEFT)
+        # Bottom Progress + Compact Log Console
+        prog_row = tk.Frame(outer, bg=self.BG)
+        prog_row.pack(fill=tk.X, pady=(0, 4))
 
-        self.stage_lbl = tk.Label(action_bar, text="Ready", font=(self.ui_font, 9), fg=self.MUTED, bg=self.BG)
-        self.stage_lbl.pack(side=tk.RIGHT)
+        self.stage_lbl = tk.Label(prog_row, text="Ready", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.BG)
+        self.stage_lbl.pack(side=tk.LEFT)
 
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress = ttk.Progressbar(outer, style="NF.Horizontal.TProgressbar", mode="determinate", maximum=100.0, variable=self.progress_var)
-        self.progress.pack(fill=tk.X, pady=(0, 8))
+        self.progress.pack(fill=tk.X, pady=(0, 6))
 
-        # Log console
         log_card = tk.Frame(outer, bg=self.CONSOLE, highlightthickness=1, highlightbackground=self.BORDER)
-        log_card.pack(fill=tk.BOTH, expand=True)
+        log_card.pack(fill=tk.X)
 
-        log_top = tk.Frame(log_card, bg=self.CONSOLE, padx=10, pady=4)
-        log_top.pack(fill=tk.X)
+        log_head = tk.Frame(log_card, bg=self.CONSOLE, padx=8, pady=3)
+        log_head.pack(fill=tk.X)
+        tk.Label(log_head, text="Build Log", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.CONSOLE).pack(side=tk.LEFT)
+        self._btn(log_head, "Clear", self._clear_log, bg="#1b1e26", hover="#262b36", pad=(7, 1), size=8).pack(side=tk.RIGHT)
+        self._btn(log_head, "Save", self._save_log, bg="#1b1e26", hover="#262b36", pad=(7, 1), size=8).pack(side=tk.RIGHT, padx=(0, 4))
 
-        tk.Label(log_top, text="Build Log", font=(self.ui_font, 9, "bold"), fg=self.MUTED, bg=self.CONSOLE).pack(side=tk.LEFT)
-        self._btn(log_top, "Clear", self._clear_log, bg="#1d2028", hover="#292e3a", pad=(8, 1), size=8).pack(side=tk.RIGHT)
-        self._btn(log_top, "Save Log", self._save_log, bg="#1d2028", hover="#292e3a", pad=(8, 1), size=8).pack(side=tk.RIGHT, padx=(0, 6))
+        log_body = tk.Frame(log_card, bg=self.CONSOLE)
+        log_body.pack(fill=tk.X)
 
         self.log_text = tk.Text(
-            log_card,
+            log_body,
+            height=6,
             bg=self.CONSOLE,
-            fg="#d5dae3",
+            fg="#d2d8e2",
             insertbackground=self.TEXT,
             font=(self.mono_font, 9),
             relief=tk.FLAT,
-            padx=10,
-            pady=6,
+            padx=8,
+            pady=4,
             wrap=tk.WORD,
             state=tk.DISABLED,
         )
-        log_scroll = ttk.Scrollbar(log_card, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        lscroll = ttk.Scrollbar(log_body, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=lscroll.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        lscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-    def _btn(self, parent, text, cmd, bg, hover, pad=(12, 4), size=9, bold=False) -> tk.Button:
-        b = tk.Button(
+    def _btn(self, parent, text, cmd, bg, hover, pad=(10, 4), size=9, bold=False) -> tk.Button:
+        return tk.Button(
             parent,
             text=text,
             command=cmd,
@@ -409,10 +424,11 @@ class NewbiesFlasherApp:
             pady=pad[1],
             cursor="hand2",
         )
-        return b
 
-    def _labeled_entry(self, parent, label: str, var: tk.StringVar) -> None:
-        tk.Label(parent, text=label, font=(self.ui_font, 9, "bold"), fg=self.TEXT, bg=self.SURFACE).pack(anchor=tk.W)
+    def _grid_entry(self, parent, row: int, col: int, label: str, var: tk.StringVar, pad_right: int) -> None:
+        tk.Label(parent, text=label, font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).grid(
+            row=row, column=col, sticky="w", padx=(0, pad_right)
+        )
         tk.Entry(
             parent,
             textvariable=var,
@@ -424,12 +440,12 @@ class NewbiesFlasherApp:
             highlightthickness=1,
             highlightbackground=self.BORDER,
             highlightcolor=self.ACCENT,
-        ).pack(fill=tk.X, pady=(2, 6), ipady=4)
+        ).grid(row=row + 1, column=col, sticky="ew", padx=(0, pad_right), pady=(1, 5), ipady=3)
 
     def _on_zstd_change(self, val: str) -> None:
         lvl = int(float(val))
         self.zstd_var.set(lvl)
-        note = "Raw / No ZSTD" if lvl == 0 else ("Fast" if lvl <= 3 else ("Ultra" if lvl >= 20 else "Balanced"))
+        note = "Raw" if lvl == 0 else ("Fast" if lvl <= 3 else ("Ultra" if lvl >= 20 else "Balanced"))
         self.zstd_lbl.config(text=f"Level {lvl} ({note})")
 
     def _on_zip_change(self, val: str) -> None:
@@ -481,14 +497,20 @@ class NewbiesFlasherApp:
             if p.selected:
                 sel_count += 1
                 sel_raw += p.raw_size
+            tags = ()
+            if not p.selected:
+                tags = ("unchecked",)
+            elif p.kind == "bootloader":
+                tags = ("bootloader",)
             self.tree.insert(
                 "",
                 tk.END,
                 iid=str(idx),
                 values=(mark, p.name, p.kind, p.fmt, _fmt_size(p.raw_size), _fmt_size(p.file_size)),
+                tags=tags,
             )
         self.sel_summary_lbl.config(
-            text=f"Selected: {sel_count} / {len(self.partitions)}   |   Uncompressed: {_fmt_size(sel_raw)}"
+            text=f"Selected: {sel_count}/{len(self.partitions)} | Raw: {_fmt_size(sel_raw)}"
         )
 
     def _toggle_index(self, idx: int) -> None:
@@ -510,6 +532,10 @@ class NewbiesFlasherApp:
 
     def _set_all_selected(self, flag: bool) -> None:
         self.partitions = [replace(p, selected=flag) for p in self.partitions]
+        self._refresh_tree()
+
+    def _select_safe_only(self) -> None:
+        self.partitions = [replace(p, selected=(p.kind != "bootloader")) for p in self.partitions]
         self._refresh_tree()
 
     def _current_config(self) -> BuildConfig:
@@ -535,6 +561,7 @@ class NewbiesFlasherApp:
             zip_level=self.zip_var.get(),
             include_fastboot=self.fastboot_var.get(),
             verify_sha256=self.sha256_var.get(),
+            clean_super=self.clean_super_var.get(),
             partitions=list(self.partitions),
         )
 
@@ -567,7 +594,7 @@ class NewbiesFlasherApp:
         scripts = preview_scripts(self._current_config())
         win = tk.Toplevel(self.root)
         win.title("Generated Scripts Preview")
-        win.geometry("820x600")
+        win.geometry("800x540")
         win.configure(bg=self.BG)
 
         nb = ttk.Notebook(win)

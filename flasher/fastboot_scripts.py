@@ -121,9 +121,15 @@ def generate_windows_fastboot(
             "goto wait_fastbootd",
             ":fastbootd_ready",
             '"%FASTBOOT%" snapshot-update cancel >nul 2>&1',
-            "echo Flashing dynamic partitions...",
+            'set "OTHER_SLOT="',
+            'for /f "tokens=2" %%s in (\'"%FASTBOOT%" getvar current-slot 2^>^&1 ^| findstr /i "current-slot:"\') do (',
+            '    if /i "%%s"=="a" set "OTHER_SLOT=_b"',
+            '    if /i "%%s"=="b" set "OTHER_SLOT=_a"',
+            ")",
+            "echo Freeing inactive slot space and flashing dynamic partitions...",
         ])
         for sp in dynamic_imgs:
+            lines.append(f'if defined OTHER_SLOT "%FASTBOOT%" resize-logical-partition "{sp}!OTHER_SLOT!" 0 >nul 2>&1')
             lines.extend(_win_flash_block(sp, use_zstd))
         lines.append("echo.")
 
@@ -279,9 +285,14 @@ def _generate_unix_fastboot(
             "done",
             '[ "$ready" -eq 1 ] || { echo "[ERROR] Timed out waiting for fastbootd"; exit 1; }',
             '"$FASTBOOT" snapshot-update cancel >/dev/null 2>&1 || true',
-            'echo "Flashing dynamic partitions..."',
+            'CUR_SLOT=$("$FASTBOOT" getvar current-slot 2>&1 | awk \'/current-slot:/ {print $2; exit}\' || true)',
+            'OTHER_SLOT=""',
+            '[ "$CUR_SLOT" = "a" ] && OTHER_SLOT="_b"',
+            '[ "$CUR_SLOT" = "b" ] && OTHER_SLOT="_a"',
+            'echo "Freeing inactive slot space and flashing dynamic partitions..."',
         ])
         for sp in dynamic_imgs:
+            lines.append(f'[ -n "$OTHER_SLOT" ] && "$FASTBOOT" resize-logical-partition "{sp}${{OTHER_SLOT}}" 0 >/dev/null 2>&1 || true')
             lines.extend(_unix_flash_block(sp, use_zstd))
         lines.append('echo ""')
 
