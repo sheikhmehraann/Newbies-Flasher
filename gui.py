@@ -738,29 +738,33 @@ class NewbiesFlasherApp:
         self.zip_var = tk.IntVar(value=1)
         self.zip_slider = self._make_slider_row(self.opt_body, self.zip_var, 0, 9, self._update_zip_ui)
 
-        # Output ZIP Preview + Folder Picker
+        # Output Folder Picker + Live Output ZIP Name
         out_head = tk.Frame(self.opt_body, bg=self.SURFACE)
         out_head.pack(fill=tk.X, pady=(4, 0))
-        self._pill(out_head, "Change Folder...", self._browse_output_dir, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(8, 2), size=8, bold=True, pill=True, border=self.BORDER).pack(side=tk.RIGHT)
-        tk.Label(out_head, text="Output ZIP", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
+        tk.Label(out_head, text="Output Folder", font=(self.ui_font, 8, "bold"), fg=self.MUTED, bg=self.SURFACE).pack(side=tk.LEFT)
+        self.out_name_lbl = tk.Label(out_head, text="", font=(self.mono_font, 8, "bold"), fg=self.ACCENT_HOVER, bg=self.SURFACE)
+        self.out_name_lbl.pack(side=tk.RIGHT)
 
-        self.out_name_lbl = tk.Label(
-            self.opt_body,
-            text="",
-            font=(self.mono_font, 8),
-            fg=self.TEXT,
+        out_row = tk.Frame(self.opt_body, bg=self.SURFACE)
+        out_row.pack(fill=tk.X, pady=(2, 1))
+        self._pill(out_row, "Browse...", self._browse_output_dir, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.SURFACE, pad=(9, 3), size=8, bold=True, border=self.BORDER).pack(side=tk.RIGHT)
+
+        self.out_dir_var = tk.StringVar(value=self.output_dir)
+        self.out_dir_entry = tk.Entry(
+            out_row,
+            textvariable=self.out_dir_var,
+            font=(self.ui_font, 8),
             bg=self.INPUT,
-            anchor=tk.W,
-            padx=6,
-            pady=3,
+            fg=self.TEXT,
+            insertbackground=self.TEXT,
+            relief=tk.FLAT,
             highlightthickness=1,
             highlightbackground=self.BORDER,
+            highlightcolor=self.ACCENT,
         )
-        self.out_name_lbl.pack(fill=tk.X, pady=(2, 1))
-
-        self.out_dir_lbl = tk.Label(self.opt_body, text="", font=(self.ui_font, 7), fg=self.MUTED, bg=self.SURFACE, anchor=tk.W)
-        self.out_dir_lbl.pack(fill=tk.X)
-        self.out_dir_lbl.bind("<Configure>", lambda _e: self._update_output_dir_label())
+        self.out_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3, padx=(0, 5))
+        self.out_dir_entry.bind("<FocusOut>", lambda _e: self._sync_output_dir_from_entry())
+        self.out_dir_entry.bind("<Return>", lambda _e: self._sync_output_dir_from_entry())
 
         # Pinned CTA Footer (always full height, never squished)
         cta_row = tk.Frame(self.right_card, bg=self.SURFACE)
@@ -959,7 +963,6 @@ class NewbiesFlasherApp:
                     self.sel_summary_lbl.pack(side=tk.RIGHT)
 
         self._sync_opt_scroll()
-        self._update_output_dir_label()
 
     def _pill(
         self,
@@ -1106,15 +1109,16 @@ class NewbiesFlasherApp:
         if hasattr(self, "out_name_lbl"):
             self._update_output_preview()
 
-    def _update_output_dir_label(self) -> None:
-        if not hasattr(self, "out_dir_lbl") or not self.out_dir_lbl.winfo_exists():
-            return
-        avail_px = max(180, self.out_dir_lbl.winfo_width())
-        max_chars = max(24, int(avail_px / max(5.5, 5.8 * self.dpi)))
-        short_dir = self.output_dir
-        if len(short_dir) > max_chars:
-            short_dir = "..." + short_dir[-(max_chars - 3):]
-        self.out_dir_lbl.config(text=f"Dir: {short_dir}")
+    def _resolve_output_dir(self) -> str:
+        raw = self.out_dir_var.get().strip().strip('"').strip("'") if hasattr(self, "out_dir_var") else self.output_dir
+        target = os.path.abspath(os.path.expanduser(raw)) if raw else os.path.join(ROOT_DIR, "output")
+        self.output_dir = target
+        return target
+
+    def _sync_output_dir_from_entry(self) -> None:
+        resolved = self._resolve_output_dir()
+        if self.out_dir_var.get() != resolved:
+            self.out_dir_var.set(resolved)
 
     def _update_output_preview(self) -> None:
         dev = self.device_var.get().strip() or DEFAULT_DEVICE
@@ -1122,7 +1126,6 @@ class NewbiesFlasherApp:
         ver = self.version_var.get().strip() or DEFAULT_VERSION
         fname = format_output_filename(dev, ver, code)
         self.out_name_lbl.config(text=fname)
-        self._update_output_dir_label()
 
     def _browse_folder(self) -> None:
         cur = self.path_var.get().strip().strip('"').strip("'")
@@ -1133,10 +1136,11 @@ class NewbiesFlasherApp:
             self._trigger_scan_now()
 
     def _browse_output_dir(self) -> None:
-        folder = filedialog.askdirectory(title="Select Output Folder", initialdir=self.output_dir if os.path.isdir(self.output_dir) else ROOT_DIR)
+        cur = self._resolve_output_dir()
+        folder = filedialog.askdirectory(title="Select Output Folder", initialdir=cur if os.path.isdir(cur) else ROOT_DIR)
         if folder:
             self.output_dir = os.path.abspath(folder)
-            self._update_output_preview()
+            self.out_dir_var.set(self.output_dir)
 
     def _schedule_scan(self, _event=None) -> None:
         if self.scan_after_id is not None:
@@ -1270,9 +1274,10 @@ class NewbiesFlasherApp:
         ver = self.version_var.get().strip() or DEFAULT_VERSION
         maint = self.maintainer_var.get().strip() or DEFAULT_MAINTAINER
 
-        os.makedirs(self.output_dir, exist_ok=True)
+        out_dir = self._resolve_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
         mode = self.vbmeta_var.get()
-        out_zip = os.path.join(self.output_dir, format_output_filename(dev, ver, code))
+        out_zip = os.path.join(out_dir, format_output_filename(dev, ver, code))
 
         return BuildConfig(
             imgs_dir=imgs_dir,
@@ -1420,8 +1425,9 @@ class NewbiesFlasherApp:
         self.stage_lbl.config(text="Cancelling...", fg=self.WARN)
 
     def _open_output(self) -> None:
-        os.makedirs(self.output_dir, exist_ok=True)
-        target = self.last_output if (self.last_output and os.path.isfile(self.last_output)) else self.output_dir
+        out_dir = self._resolve_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        target = self.last_output if (self.last_output and os.path.isfile(self.last_output)) else out_dir
         reveal_in_file_manager(target)
 
     def _on_close(self) -> None:

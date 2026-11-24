@@ -351,15 +351,37 @@ class TestNewbiesFlasher(unittest.TestCase):
             self.assertEqual(read_vbmeta_flags(vb_raw), 3)
             self.assertEqual(read_vbmeta_flags(vbs_raw), 0)
 
-    def test_raw_mode_parallel_unsparse_build(self) -> None:
+    def test_raw_mode_direct_sparse_to_zip_streaming(self) -> None:
         sp_vendor = os.path.join(self.imgs, "vendor.img")
         expected_vendor = _make_sparse_test_image(sp_vendor)
-        out_zip = os.path.join(self.tmp, "raw_out.zip")
-        cfg = BuildConfig(imgs_dir=self.imgs, output_zip=out_zip, zstd_level=0, zip_level=1)
-        res = build_package(cfg)
-        self.assertTrue(os.path.isfile(res.output_zip))
-        with zipfile.ZipFile(res.output_zip, "r") as zf:
-            self.assertEqual(zf.read("vendor.img"), expected_vendor)
+        for zipl in (0, 1):
+            out_zip = os.path.join(self.tmp, f"raw_out_{zipl}.zip")
+            cfg = BuildConfig(imgs_dir=self.imgs, output_zip=out_zip, zstd_level=0, zip_level=zipl)
+            res = build_package(cfg, on_log=lambda _m: None)
+            self.assertTrue(os.path.isfile(res.output_zip))
+            with zipfile.ZipFile(res.output_zip, "r") as zf:
+                self.assertIsNone(zf.testzip())
+                self.assertEqual(zf.read("vendor.img"), expected_vendor)
+
+    def test_cli_output_dir_option(self) -> None:
+        custom_out = os.path.join(self.tmp, "custom_out_dir")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(ROOT, "main.py"),
+                "-i", self.imgs,
+                "-c", "X6871",
+                "-v", "3.0",
+                "-O", custom_out,
+                "--zstd-level", "0",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        expected_zip = os.path.join(custom_out, "X6871-3.0-Flashable.zip")
+        self.assertTrue(os.path.isfile(expected_zip))
 
     def test_pipelined_large_image_streaming_and_meta_first_order(self) -> None:
         sp_vendor = os.path.join(self.imgs, "vendor.img")
@@ -549,6 +571,13 @@ class TestNewbiesFlasher(unittest.TestCase):
             # Ensure requested UI height fits inside a standard 768p laptop screen
             self.assertLessEqual(root.winfo_reqheight(), 680)
             self.assertEqual(len(app.tree.get_children()), len(app.partitions))
+
+            # Verify editable Output Folder field updates target output_zip cleanly
+            custom_gui_out = os.path.join(self.tmp, "gui_out")
+            app.out_dir_var.set(custom_gui_out)
+            cfg = app._current_config()
+            self.assertEqual(os.path.dirname(cfg.output_zip), os.path.abspath(custom_gui_out))
+            self.assertEqual(os.path.basename(cfg.output_zip), "X6871-15.1.2-Flashable.zip")
 
             # Verify PillButton controls are enabled, clickable, and unsquished
             self.assertTrue(app.build_btn.enabled)

@@ -90,6 +90,7 @@ def interactive_flow() -> None:
         "maintainer": DEFAULT_MAINTAINER,
         "zstd_level": 1,
         "zip_level": 1,
+        "output_dir": os.path.join(ROOT_DIR, "output"),
     }
 
     step = 1
@@ -121,49 +122,49 @@ def interactive_flow() -> None:
                 if props["version"] and state["version"] in ("", DEFAULT_VERSION):
                     state["version"] = props["version"]
 
-                step = 9 if return_to_review else 2
+                step = 10 if return_to_review else 2
                 return_to_review = False
 
             elif step == 2:
                 val = input(f"Device name ({state['device']}) : ").strip()
                 if val.lower() in ("b", "back"):
-                    step = 9 if return_to_review else 1
+                    step = 10 if return_to_review else 1
                     return_to_review = False
                     continue
                 if val:
                     state["device"] = val
-                step = 9 if return_to_review else 3
+                step = 10 if return_to_review else 3
                 return_to_review = False
 
             elif step == 3:
                 cur = state["codename"] or "none"
                 val = input(f"Codename ({cur}, '-' for any) : ").strip()
                 if val.lower() in ("b", "back"):
-                    step = 9 if return_to_review else 2
+                    step = 10 if return_to_review else 2
                     return_to_review = False
                     continue
                 if val == "-":
                     state["codename"] = ""
                 elif val:
                     state["codename"] = val
-                step = 9 if return_to_review else 4
+                step = 10 if return_to_review else 4
                 return_to_review = False
 
             elif step == 4:
                 val = input(f"ROM version ({state['version']}) : ").strip()
                 if val.lower() in ("b", "back"):
-                    step = 9 if return_to_review else 3
+                    step = 10 if return_to_review else 3
                     return_to_review = False
                     continue
                 if val:
                     state["version"] = val
-                step = 9 if return_to_review else 5
+                step = 10 if return_to_review else 5
                 return_to_review = False
 
             elif step == 5:
                 val = input(f"AVB 2.0 vbmeta [skip/disable/enable] ({state['vbmeta']}) : ").strip().lower()
                 if val in ("b", "back"):
-                    step = 9 if return_to_review else 4
+                    step = 10 if return_to_review else 4
                     return_to_review = False
                     continue
                 if val in ("skip", "s", "1"):
@@ -175,24 +176,24 @@ def interactive_flow() -> None:
                 elif val:
                     print("Enter skip, disable, or enable.")
                     continue
-                step = 9 if return_to_review else 6
+                step = 10 if return_to_review else 6
                 return_to_review = False
 
             elif step == 6:
                 val = input(f"Maintainer ({state['maintainer']}) : ").strip()
                 if val.lower() in ("b", "back"):
-                    step = 9 if return_to_review else 5
+                    step = 10 if return_to_review else 5
                     return_to_review = False
                     continue
                 if val:
                     state["maintainer"] = val
-                step = 9 if return_to_review else 7
+                step = 10 if return_to_review else 7
                 return_to_review = False
 
             elif step == 7:
                 val = input(f"ZSTD level 0-22 ({state['zstd_level']}) : ").strip()
                 if val.lower() in ("b", "back"):
-                    step = 9 if return_to_review else 6
+                    step = 10 if return_to_review else 6
                     return_to_review = False
                     continue
                 if val:
@@ -206,13 +207,13 @@ def interactive_flow() -> None:
                     except ValueError:
                         print("Enter a number between 0 and 22.")
                         continue
-                step = 9 if return_to_review else 8
+                step = 10 if return_to_review else 8
                 return_to_review = False
 
             elif step == 8:
                 val = input(f"ZIP level 0-9 ({state['zip_level']}) : ").strip()
                 if val.lower() in ("b", "back"):
-                    step = 9 if return_to_review else 7
+                    step = 10 if return_to_review else 7
                     return_to_review = False
                     continue
                 if val:
@@ -226,10 +227,22 @@ def interactive_flow() -> None:
                     except ValueError:
                         print("Enter a number between 0 and 9.")
                         continue
-                step = 9
+                step = 10 if return_to_review else 9
                 return_to_review = False
 
             elif step == 9:
+                val = input(f"Output folder ({state['output_dir']}) : ").strip()
+                if val.lower() in ("b", "back"):
+                    step = 10 if return_to_review else 8
+                    return_to_review = False
+                    continue
+                if val:
+                    state["output_dir"] = clean_path(val)
+                step = 10
+                return_to_review = False
+
+            elif step == 10:
+                out_name = format_output_filename(state["device"], state["version"], state["codename"])
                 print("\n------------------------------------------------------------------------")
                 print("Build Configuration")
                 print(f"  1. Images folder : {state['imgs_dir']} ({len(state['partitions'])} files)")
@@ -240,23 +253,24 @@ def interactive_flow() -> None:
                 print(f"  6. Maintainer    : {state['maintainer']}")
                 print(f"  7. ZSTD level    : {state['zstd_level']}")
                 print(f"  8. ZIP level     : {state['zip_level']}")
+                print(f"  9. Output folder : {state['output_dir']} -> {out_name}")
                 print("------------------------------------------------------------------------")
-                ans = input("Start build? (y/n, 1-8 to edit, b to go back) : ").strip().lower()
+                ans = input("Start build? (y/n, 1-9 to edit, b to go back) : ").strip().lower()
                 if ans in ("", "y", "yes"):
                     break
                 if ans in ("b", "back"):
-                    step = 8
+                    step = 9
                     continue
                 if ans in ("n", "no", "q", "quit"):
                     print("Build cancelled.")
                     return
-                if ans in ("1", "2", "3", "4", "5", "6", "7", "8"):
+                if ans in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
                     step = int(ans)
                     return_to_review = True
                     continue
-                print("Enter y, n, b, or a number from 1 to 8.")
+                print("Enter y, n, b, or a number from 1 to 9.")
 
-        out_dir = os.path.join(ROOT_DIR, "output")
+        out_dir = state["output_dir"] or os.path.join(ROOT_DIR, "output")
         os.makedirs(out_dir, exist_ok=True)
         out_zip = os.path.join(
             out_dir,
@@ -300,7 +314,8 @@ def cli_flow() -> None:
     parser.add_argument("--vbmeta", choices=("skip", "disable", "enable"), default="skip", help="AVB 2.0 vbmeta mode")
     parser.add_argument("--zstd-level", type=int, default=1, help="ZSTD compression level (0 disables zstd, 1-22 enables)")
     parser.add_argument("--zip-level", type=int, default=1, help="ZIP deflate level for raw files (0-9; .zst is always stored)")
-    parser.add_argument("-o", "--output", help="Custom output ZIP path")
+    parser.add_argument("-o", "--output", help="Custom output ZIP path (or folder)")
+    parser.add_argument("-O", "--output-dir", dest="output_dir", help="Output folder for generated ZIP (default: ./output)")
     parser.add_argument("--exclude", default="", help="Comma-separated partition names to skip")
     parser.add_argument("--print-script", action="store_true", help="Print generated update-binary and exit without building")
     parser.add_argument("--gui", action="store_true", help="Launch desktop GUI")
@@ -335,11 +350,17 @@ def cli_flow() -> None:
         from dataclasses import replace
         parts = [replace(p, selected=(p.name.lower() not in excluded)) for p in parts]
 
-    out_dir = os.path.join(ROOT_DIR, "output")
-    os.makedirs(out_dir, exist_ok=True)
-    out_zip = clean_path(args.output) if args.output else os.path.join(
-        out_dir, format_output_filename(device, version, codename)
-    )
+    default_name = format_output_filename(device, version, codename)
+    if args.output:
+        cand = clean_path(args.output)
+        if os.path.isdir(cand):
+            out_zip = os.path.join(cand, default_name)
+        else:
+            out_zip = cand
+    else:
+        out_dir = clean_path(args.output_dir) if args.output_dir else os.path.join(ROOT_DIR, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        out_zip = os.path.join(out_dir, default_name)
 
     cfg = BuildConfig(
         imgs_dir=imgs_path,

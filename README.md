@@ -75,7 +75,7 @@ chmod +x run_termux.sh
    - Selecting **Disable** or **Enable** with no partition images builds a lightweight standalone flashable ZIP (`Codename-Version-Flashable.zip`).
    - ZSTD Level `1` gives the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.
    - ZIP Level applies to scripts when ZSTD is enabled, or to raw `.img` files when ZSTD is `0`.
-5. Check the live Output ZIP preview (`X6871-1.0-Flashable.zip`) and click **Change Folder...** if you want a custom output directory.
+5. Check the **Output Folder** (type/paste a path or click **Browse...**) and the live `Codename-Version-Flashable.zip` filename preview.
 6. Click **Preview Script** to inspect or copy the generated `update-binary` before building.
 7. Click **Build Flashable ZIP** (`Ctrl+B`).
 
@@ -106,7 +106,8 @@ Useful flags:
 - `--exclude preloader_raw,lk` : skip specific partitions.
 - `--codename ""` : skip the on-device codename check (universal ZIP).
 - `--print-script` : print the generated `update-binary` without building a ZIP.
-- `-o /path/to/out.zip` : set a custom output file path.
+- `-O /path/to/folder` (`--output-dir`) : set the output folder (ZIP is auto-named `Codename-Version-Flashable.zip`).
+- `-o /path/to/out.zip` : set a custom output file path (or existing folder).
 - `--gui` : open the desktop GUI.
 
 ## Flashing the Output ZIP

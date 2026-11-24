@@ -462,6 +462,55 @@ class _StreamingZipWriter:
                         on_progress(min(99.0, progress_base + progress_span * frac), f"Packing {arc} ({mbps:.0f} MB/s)")
         return sz
 
+    def add_sparse_raw(
+        self,
+        src_path: str,
+        rp: str,
+        raw_sz: int,
+        on_progress: Optional[ProgressCallback] = None,
+        progress_base: float = 68.0,
+        progress_span: float = 31.0,
+        total_est_bytes: int = 0,
+    ) -> int:
+        """Stream Android sparse image directly into ZIP as raw .img with zero temp file on disk."""
+        assert self._zf is not None
+        assert self._fh is not None
+        if self.cancel_event and self.cancel_event.is_set():
+            raise RuntimeError("Build cancelled")
+
+        arc = rp.replace("\\", "/").lstrip("/")
+        self._ensure_dirs(arc)
+
+        st = os.stat(src_path)
+        comp_type = zipfile.ZIP_STORED if self.zip_level <= 0 else zipfile.ZIP_DEFLATED
+
+        zinfo = zipfile.ZipInfo(filename=arc)
+        zinfo.date_time = time.localtime(st.st_mtime)[:6]
+        zinfo.compress_type = comp_type
+        zinfo._compresslevel = self.zip_level if comp_type == zipfile.ZIP_DEFLATED else None
+        zinfo.create_system = 3
+        zinfo.file_size = raw_sz
+        zinfo.external_attr = 0o100644 << 16
+
+        cur_offset = self._fh.tell()
+        use_zip64 = raw_sz >= ZIP64_THRESHOLD or (cur_offset + raw_sz) >= ZIP64_THRESHOLD
+        cancel_check = (lambda: bool(self.cancel_event and self.cancel_event.is_set()))
+
+        with self._zf.open(zinfo, mode="w", force_zip64=use_zip64) as dst_f:
+            def _write_chunk(mv: memoryview) -> None:
+                dst_f.write(mv)
+                self.written_bytes += len(mv)
+                if on_progress and total_est_bytes > 0:
+                    now = time.monotonic()
+                    if now - self.last_prog_ts >= 0.06:
+                        self.last_prog_ts = now
+                        dt = max(0.05, now - self.start_ts)
+                        mbps = (self.written_bytes / 1048576.0) / dt
+                        frac = min(1.0, self.written_bytes / total_est_bytes)
+                        on_progress(min(99.0, progress_base + progress_span * frac), f"Packing {arc} ({mbps:.0f} MB/s)")
+
+            return unsparse_to_stream(src_path, _write_chunk, cancel_check=cancel_check)
+
 
 def build_package(
     cfg: BuildConfig,
@@ -557,15 +606,15 @@ def build_package(
 
         small_comp_jobs = []
         large_comp_jobs = []
-        unsparse_jobs = []
         decompress_jobs = []
-        ready_files: Dict[str, Tuple[PartitionImage, str, int, bool]] = {}  # (p, path, raw_sz, is_temp)
+        # ready_files[name] = (p, path, raw_sz, is_temp, stream_sparse_raw)
+        ready_files: Dict[str, Tuple[PartitionImage, str, int, bool, bool]] = {}
 
-        # Stream already-ready images directly from source path without redundant temp copies.
+        # Stream already-ready images (and raw-mode sparse images) directly without redundant temp copies.
         for name, (p, eff_path, eff_fmt, eff_raw) in prepared.items():
             if use_zstd:
                 if eff_fmt == "zstd":
-                    ready_files[name] = (p, eff_path, eff_raw, False)
+                    ready_files[name] = (p, eff_path, eff_raw, False, False)
                 else:
                     dst = os.path.join(stage_dir, f"{name}.img.zst")
                     job = (p, eff_path, dst, eff_raw, eff_fmt == "sparse")
@@ -578,13 +627,12 @@ def build_package(
                     dst = os.path.join(stage_dir, f"{name}.img")
                     decompress_jobs.append((p, eff_path, dst))
                 elif eff_fmt == "sparse":
-                    dst = os.path.join(stage_dir, f"{name}.img")
-                    unsparse_jobs.append((p, eff_path, dst))
+                    ready_files[name] = (p, eff_path, eff_raw, False, True)
                 else:
-                    ready_files[name] = (p, eff_path, eff_raw, False)
+                    ready_files[name] = (p, eff_path, eff_raw, False, False)
 
         total_cpus = os.cpu_count() or 4
-        total_work_items = len(small_comp_jobs) + len(large_comp_jobs) + len(unsparse_jobs) + len(decompress_jobs)
+        total_work_items = len(small_comp_jobs) + len(large_comp_jobs) + len(decompress_jobs)
         completed_work = 0
 
         if small_comp_jobs:
@@ -609,27 +657,8 @@ def build_package(
                     ratio = (comp_sz / raw_sz * 100.0) if raw_sz else 0.0
                     tag = " [sparse->zstd]" if is_sp else ""
                     log(f"  {p.name}{tag}: {raw_sz / 1048576:.1f} MB -> {comp_sz / 1048576:.1f} MB ({ratio:.0f}%)")
-                    ready_files[p.name] = (p, dst, raw_sz, True)
+                    ready_files[p.name] = (p, dst, raw_sz, True, False)
                     progress(10.0 + (45.0 * completed_work / max(1, total_work_items)), f"Compressed {p.name} ({completed_work}/{total_work_items})")
-
-        if unsparse_jobs:
-            unsparse_jobs.sort(key=lambda item: item[0].raw_size, reverse=True)
-            workers = min(len(unsparse_jobs), max(1, min(4, total_cpus)))
-            log(f"Unsparsing {len(unsparse_jobs)} image(s) ({workers} worker)...")
-
-            def _do_unsparse(job):
-                p, src, dst = job
-                raw_sz = unsparse_image(src, dst, cancel_check=cancel_check)
-                return p, dst, raw_sz
-
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = [ex.submit(_do_unsparse, job) for job in unsparse_jobs]
-                for fut in as_completed(futs):
-                    p, dst, raw_sz = fut.result()
-                    completed_work += 1
-                    log(f"  {p.name}: unsparsed {raw_sz / 1048576:.1f} MB")
-                    ready_files[p.name] = (p, dst, raw_sz, True)
-                    progress(10.0 + (45.0 * completed_work / max(1, total_work_items)), f"Unsparsed {p.name} ({completed_work}/{total_work_items})")
 
         if decompress_jobs:
             decompress_jobs.sort(key=lambda item: item[0].raw_size, reverse=True)
@@ -647,7 +676,7 @@ def build_package(
                     p, dst, raw_sz = fut.result()
                     completed_work += 1
                     log(f"  {p.name}: {raw_sz / 1048576:.1f} MB")
-                    ready_files[p.name] = (p, dst, raw_sz, True)
+                    ready_files[p.name] = (p, dst, raw_sz, True, False)
                     progress(10.0 + (45.0 * completed_work / max(1, total_work_items)), f"Decompressed {p.name} ({completed_work}/{total_work_items})")
 
         check_cancel()
@@ -714,11 +743,12 @@ def build_package(
         meta_entries.append((us_path, "META-INF/com/google/android/updater-script", False))
 
         # Order already-ready files: META-INF first, then small images before large images.
-        initial_entries: List[Tuple[str, str, int, bool, bool]] = []
+        initial_entries: List[Tuple[str, str, int, bool, bool, bool]] = []
         for fp, rp, is_exec in meta_entries:
-            initial_entries.append((fp, rp, os.path.getsize(fp), is_exec, False))
-        for name, (p, fp, _raw_sz, is_temp) in ready_files.items():
-            initial_entries.append((fp, f"{name}{ext}", os.path.getsize(fp), False, is_temp))
+            initial_entries.append((fp, rp, os.path.getsize(fp), is_exec, False, False))
+        for name, (p, fp, raw_sz, is_temp, is_sparse_stream) in ready_files.items():
+            eff_sz = raw_sz if is_sparse_stream else os.path.getsize(fp)
+            initial_entries.append((fp, f"{name}{ext}", eff_sz, False, is_temp, is_sparse_stream))
         initial_entries.sort(key=lambda item: _entry_pack_priority(item[1], item[2]))
 
         est_initial_bytes = sum(item[2] for item in initial_entries)
@@ -730,12 +760,13 @@ def build_package(
             out_dir = os.path.dirname(output_zip) or "."
             os.makedirs(out_dir, exist_ok=True)
             free_bytes = shutil.disk_usage(out_dir).free
-            min_needed = est_initial_bytes + (4 * 1024 * 1024)
-            if free_bytes < min_needed:
-                raise RuntimeError(
-                    f"Not enough free disk space in {out_dir}: "
-                    f"need at least {min_needed / 1048576:.1f} MB, have {free_bytes / 1048576:.1f} MB."
-                )
+            if cfg.zip_level <= 0 or use_zstd:
+                min_needed = est_initial_bytes + (4 * 1024 * 1024)
+                if free_bytes < min_needed:
+                    raise RuntimeError(
+                        f"Not enough free disk space in {out_dir}: "
+                        f"need at least {min_needed / 1048576:.1f} MB, have {free_bytes / 1048576:.1f} MB."
+                    )
         except OSError:
             pass
 
@@ -743,6 +774,19 @@ def build_package(
         log(f"Packing {os.path.basename(output_zip)}...")
 
         with _StreamingZipWriter(output_zip, cfg.zip_level, cancel_event) as zw:
+            def _pack_initial_entry(entry, base_pct: float, span_pct: float) -> None:
+                fp, rp, sz, is_exec, is_temp, is_sparse_stream = entry
+                if is_sparse_stream:
+                    log(f"  {rp} [sparse->zip]: {sz / 1048576:.1f} MB")
+                    zw.add_sparse_raw(fp, rp, sz, on_progress=on_progress, progress_base=base_pct, progress_span=span_pct, total_est_bytes=est_total_bytes)
+                else:
+                    zw.add_file(fp, rp, is_exec, on_progress=on_progress, progress_base=base_pct, progress_span=span_pct, total_est_bytes=est_total_bytes)
+                    if is_temp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except OSError:
+                            pass
+
             # Start compressing large partitions in background WHILE packing META-INF + small images.
             if large_comp_jobs:
                 large_comp_jobs.sort(key=lambda item: item[3], reverse=True)
@@ -766,13 +810,8 @@ def build_package(
                     futs = [ex.submit(_do_large, job) for job in large_comp_jobs]
 
                     # Pack META-INF and small partitions immediately while large partitions compress.
-                    for fp, rp, _sz, is_exec, is_temp in initial_entries:
-                        zw.add_file(fp, rp, is_exec, on_progress=on_progress, progress_base=60.0, progress_span=10.0, total_est_bytes=est_total_bytes)
-                        if is_temp and os.path.exists(fp):
-                            try:
-                                os.remove(fp)
-                            except OSError:
-                                pass
+                    for entry in initial_entries:
+                        _pack_initial_entry(entry, 60.0, 10.0)
 
                     # Stream each large compressed image straight into the ZIP as it finishes, freeing temp disk immediately.
                     done_large = 0
@@ -792,13 +831,8 @@ def build_package(
                         except OSError:
                             pass
             else:
-                for fp, rp, _sz, is_exec, is_temp in initial_entries:
-                    zw.add_file(fp, rp, is_exec, on_progress=on_progress, progress_base=68.0, progress_span=31.0, total_est_bytes=est_total_bytes)
-                    if is_temp and os.path.exists(fp):
-                        try:
-                            os.remove(fp)
-                        except OSError:
-                            pass
+                for entry in initial_entries:
+                    _pack_initial_entry(entry, 68.0, 31.0)
 
         elapsed = time.monotonic() - start_ts
         final_size = os.path.getsize(output_zip)
