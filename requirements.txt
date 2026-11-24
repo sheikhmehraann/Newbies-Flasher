@@ -1,0 +1,3 @@
+# Newbies Flasher uses only the Python standard library.
+# Optional fallback if your OS has no zstd executable available:
+# zstandard>=0.20.0
