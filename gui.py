@@ -1035,8 +1035,11 @@ class NewbiesFlasherApp:
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self._browse_folder())
         self.root.bind("<Control-O>", lambda _e: self._browse_folder())
+        self.root.bind("<Control-p>", lambda _e: self._open_script_preview())
+        self.root.bind("<Control-P>", lambda _e: self._open_script_preview())
         self.root.bind("<F5>", lambda _e: self._trigger_scan_now())
         self.root.bind("<Control-b>", lambda _e: self._start_build() if not self.is_building else None)
+        self.root.bind("<Control-B>", lambda _e: self._start_build() if not self.is_building else None)
         self.root.bind("<Escape>", lambda _e: self._cancel_build() if self.is_building else None)
 
     def _grid_entry(self, parent, row: int, col: int, label: str, var: tk.StringVar, pad_right: int) -> None:
@@ -1342,6 +1345,8 @@ class NewbiesFlasherApp:
         win.geometry(f"{pw}x{ph}")
         win.minsize(420, 300)
         win.configure(bg=self.BG)
+        _apply_windows_dark_chrome(win)
+        win.bind("<Escape>", lambda _e: win.destroy())
 
         bar = tk.Frame(win, bg=self.BG, padx=10, pady=8)
         bar.pack(fill=tk.X)
@@ -1355,8 +1360,21 @@ class NewbiesFlasherApp:
             copy_btn.set_text("Copied")
             win.after(1500, lambda: copy_btn.winfo_exists() and copy_btn.set_text("Copy Script"))
 
+        def _do_save():
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                title="Save Recovery Script",
+                initialfile="update-binary",
+                filetypes=[("Shell script", "*.sh"), ("All files", "*.*")],
+            )
+            if path:
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(body)
+
         copy_btn.set_command(_do_copy)
         copy_btn.pack(side=tk.RIGHT)
+        save_btn = self._pill(bar, "Save As...", _do_save, bg=self.SURFACE_ALT, hover=self.SURFACE_HOVER, parent_bg=self.BG, pad=(10, 4), size=8, bold=True, pill=True, border=self.BORDER)
+        save_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
         tk.Label(
             bar,
@@ -1483,8 +1501,13 @@ class NewbiesFlasherApp:
                 if parts:
                     dyn_n = sum(1 for p in parts if p.kind in ("dynamic", "super_raw"))
                     boot_n = sum(1 for p in parts if p.kind == "bootchain")
-                    fw_n = len(parts) - dyn_n - boot_n
-                    self.scan_lbl.config(text=f"{len(parts)} images ({dyn_n} dyn, {boot_n} boot, {fw_n} fw)", fg=self.OK)
+                    bl_n = sum(1 for p in parts if p.kind == "bootloader")
+                    fw_n = len(parts) - dyn_n - boot_n - bl_n
+                    summary = f"{len(parts)} images ({dyn_n} dyn, {boot_n} boot, {fw_n} fw"
+                    if bl_n:
+                        summary += f", {bl_n} bl"
+                    summary += ")"
+                    self.scan_lbl.config(text=summary, fg=self.OK)
                 else:
                     self.scan_lbl.config(text="No .img or .img.zst files found", fg=self.WARN)
                 if props["device"] and self.device_var.get() in ("", DEFAULT_DEVICE):

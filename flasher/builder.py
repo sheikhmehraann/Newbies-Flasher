@@ -443,6 +443,7 @@ class _StreamingZipWriter:
 
         cur_offset = self._fh.tell()
         use_zip64 = sz >= ZIP64_THRESHOLD or (cur_offset + sz) >= ZIP64_THRESHOLD
+        file_written = 0
         with open(fp, "rb") as src_f, self._zf.open(zinfo, mode="w", force_zip64=use_zip64) as dst_f:
             while True:
                 if self.cancel_event and self.cancel_event.is_set():
@@ -452,13 +453,14 @@ class _StreamingZipWriter:
                     break
                 dst_f.write(self._mv[:n])
                 self.written_bytes += n
+                file_written += n
                 if on_progress and total_est_bytes > 0:
                     now = time.monotonic()
                     if now - self.last_prog_ts >= 0.06:
                         self.last_prog_ts = now
                         dt = max(0.05, now - self.start_ts)
                         mbps = (self.written_bytes / 1048576.0) / dt
-                        frac = min(1.0, self.written_bytes / total_est_bytes)
+                        frac = min(1.0, (file_written / sz) if (total_est_bytes == sz and sz > 0) else (self.written_bytes / total_est_bytes))
                         on_progress(min(99.0, progress_base + progress_span * frac), f"Packing {arc} ({mbps:.0f} MB/s)")
         return sz
 
@@ -825,7 +827,7 @@ def build_package(
                         arc = f"{p.name}{ext}"
                         base_pct = 70.0 + (29.0 * (done_large - 1) / len(large_comp_jobs))
                         span_pct = 29.0 / len(large_comp_jobs)
-                        zw.add_file(dst, arc, False, on_progress=on_progress, progress_base=base_pct, progress_span=span_pct, total_est_bytes=zw.written_bytes + comp_sz)
+                        zw.add_file(dst, arc, False, on_progress=on_progress, progress_base=base_pct, progress_span=span_pct, total_est_bytes=comp_sz)
                         try:
                             os.remove(dst)
                         except OSError:

@@ -245,6 +245,100 @@ class TestNewbiesFlasher(unittest.TestCase):
         self.assertEqual(props["codename"], "testphone")
         self.assertEqual(props["version"], "2.5.0")
 
+    def test_all_soc_partition_classification_and_chained_vbmeta(self) -> None:
+        # MediaTek, Qualcomm, Exynos/Tensor, Unisoc, and Kirin bootloaders
+        for bl in ("preloader", "preloader_raw", "lk", "boot_para", "seccfg", "xbl", "xbl_s", "abl", "aboot", "sboot", "bl1", "bl31", "gsa", "splloader", "uboot", "sml", "tos", "xloader"):
+            self.assertEqual(classify_partition(bl, "", "raw"), "bootloader", bl)
+        # Multi-SoC firmware blobs
+        for fw in ("apusys", "audio_dsp", "md1img", "modem", "aop_config", "vm-bootsys", "radio", "acpm", "l_modem", "wcnmodem"):
+            self.assertEqual(classify_partition(fw, "", "raw"), "firmware", fw)
+        # Multi-OEM dynamic / logical partitions
+        for dyn in ("system", "vendor", "product", "system_dlkm", "vendor_dlkm", "odm_dlkm", "tr_vendor", "my_version", "prism", "optics", "vgc"):
+            self.assertEqual(classify_partition(dyn, "", "raw"), "dynamic", dyn)
+        # Chained vbmeta partitions must be bootchain and NEVER top-level patched
+        for vb in ("vbmeta_system", "vbmeta_vendor", "vbmeta_system_dlkm", "vbmeta_vendor_dlkm", "vbmeta_odm"):
+            self.assertEqual(classify_partition(vb, "", "raw"), "bootchain", vb)
+            self.assertFalse(is_top_level_vbmeta(vb), vb)
+
+    def test_recovery_script_all_soc_dynamic_retrofit_static_and_alignment(self) -> None:
+        from flasher.recovery_script import generate_update_binary
+
+        ub = generate_update_binary(
+            device="Infinix GT 20 Pro",
+            version="2.0",
+            codename="X6871",
+            maintainer="dev",
+            dynamic_specs=[("system", 10000), ("cust", 16384)],
+            super_raw=False,
+            bootchain_specs=[("boot", 8192)],
+            firmware_specs=[("modem", 4096)],
+            vbmeta_mode="disable",
+            use_zstd=True,
+        )
+        # 10000-byte odd image must round up to 4096-byte logical sector alignment (12288)
+        self.assertIn("lp_create_slot system 12288", ub)
+        self.assertIn("lp_create_slot cust 16384", ub)
+        # Universal recovery & all-SoC mechanisms
+        self.assertIn("ro.boot.super_partition", ub)
+        self.assertIn("detect_super", ub)
+        self.assertIn("is_physical_partition", ub)
+        self.assertIn("dm_unmap_force", ub)
+        self.assertIn("dmctl delete", ub)
+        self.assertIn("snapshotctl unmap", ub)
+        self.assertIn("ensure_by_name_link", ub)
+        self.assertIn("resolve_unzip", ub)
+        self.assertIn("androidboot.slot_suffix=", ub)
+        self.assertIn("/dev/block/mmcblk0boot0", ub)
+        self.assertIn("sed 's/[0-9]*$//; s/p$//'", ub)
+        self.assertNotIn("p\\?", ub)
+        self.assertIn("static GPT mode", ub)
+        self.assertIn('patch_single_vbmeta_dd "vbmeta${OTHER_SLOT}"', ub)
+
+        # Raw super.img without individual dynamic_specs must still unmount dynamic mounts
+        ub_super = generate_update_binary(
+            device="Test",
+            version="1.0",
+            codename="X6871",
+            maintainer="dev",
+            dynamic_specs=[],
+            super_raw=True,
+            bootchain_specs=[],
+            firmware_specs=[],
+            vbmeta_mode="skip",
+            use_zstd=False,
+            super_raw_size=65536,
+        )
+        self.assertIn("unmount_dynamic", ub_super)
+
+    def test_batch_zstd_scan_folder_multifile_and_mixed(self) -> None:
+        from flasher.partitions import scan_folder
+
+        zbin = get_host_zstd()
+        self.assertIsNotNone(zbin)
+        zdir = os.path.join(self.tmp, "batch_zst")
+        os.makedirs(zdir)
+
+        expected = {"boot": 12288, "vendor": 20480, "odm": 16384, "dtbo": 8192}
+        for name, sz in expected.items():
+            raw = os.path.join(self.tmp, f"{name}.raw")
+            dst = os.path.join(zdir, f"{name}.img.zst")
+            with open(raw, "wb") as f:
+                f.write((name.encode("ascii") * (sz // len(name) + 1))[:sz])
+            if name == "dtbo":
+                # Streaming no-FCS frame to exercise batch + fallback coexistence
+                with open(raw, "rb") as rf:
+                    raw_bytes = rf.read()
+                proc = subprocess.run([zbin, "-1", "-c"], input=raw_bytes, capture_output=True, check=True)
+                with open(dst, "wb") as f:
+                    f.write(proc.stdout)
+            else:
+                subprocess.run([zbin, "-1", "-f", "-q", raw, "-o", dst], check=True)
+
+        parts, _ = scan_folder(zdir, zstd_bin=zbin)
+        found = {p.name: (p.fmt, p.raw_size) for p in parts}
+        for name, sz in expected.items():
+            self.assertEqual(found[name], ("zstd", sz), name)
+
     def test_full_build_sparse_stream_no_stale_wipe_and_zip_order(self) -> None:
         sp_vendor = os.path.join(self.imgs, "vendor.img")
         expected_vendor = _make_sparse_test_image(sp_vendor)

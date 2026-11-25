@@ -18,32 +18,53 @@ _SKIP_DIRS = {".git", "__pycache__", "node_modules", "META-INF"}
 DYNAMIC_PARTITIONS = {
     "system", "vendor", "product", "system_ext", "system_dlkm",
     "vendor_dlkm", "odm_dlkm", "odm", "mi_ext", "cust",
-    "prism", "optics", "my_product", "my_stock", "my_heytap",
-    "my_carrier", "my_region", "my_manifest", "my_preload",
-    "my_company", "my_engineering", "my_bigball",
+    "prism", "optics", "vgc", "oem", "preload",
+    "my_product", "my_stock", "my_heytap", "my_carrier", "my_region",
+    "my_manifest", "my_preload", "my_company", "my_engineering",
+    "my_bigball", "my_odm", "my_version",
     "tr_carrier", "tr_company", "tr_mi", "tr_overlayfs", "tr_preload",
     "tr_product", "tr_region", "tr_theme", "tr_manifest", "tr_misc",
     "tr_vintf", "tr_vendor",
 }
 
 BOOTCHAIN_PARTITIONS = {
-    "boot", "dtbo", "init_boot", "vendor_boot", "vendor_kernel_boot",
-    "recovery", "vbmeta", "vbmeta_system", "vbmeta_vendor", "pvmfw",
+    "boot", "dtbo", "dtb", "init_boot", "vendor_boot", "vendor_kernel_boot",
+    "recovery", "vbmeta", "vbmeta_system", "vbmeta_vendor",
+    "vbmeta_system_dlkm", "vbmeta_vendor_dlkm", "vbmeta_odm", "pvmfw",
 }
 
-# Low-level bootloader partitions that can hard-brick a device if interrupted or mismatched.
+# Low-level bootloader partitions across MTK, QCOM, Exynos, Tensor, Unisoc, and Kirin.
 BOOTLOADER_PARTITIONS = {
-    "preloader", "preloader_raw", "lk", "lk2", "xbl", "xbl_config",
-    "xbl_ramdump", "abl", "sbl1", "sbl2", "sbl3", "rpm", "tz", "hyp", "uefi",
+    # MediaTek (MTK)
+    "preloader", "preloader_raw", "lk", "lk2", "boot_para", "proinfo", "seccfg",
+    # Qualcomm (QCOM)
+    "xbl", "xbl_config", "xbl_ramdump", "xbl_s", "abl", "aboot",
+    "sbl1", "sbl2", "sbl3", "rpm", "tz", "hyp", "uefi",
+    # Samsung Exynos / Google Tensor
+    "sboot", "bl1", "bl2", "bl31", "pbl", "el3_mon", "gsa", "gsa_bl1",
+    "ldfw", "tzsw", "up_param", "param", "efs",
+    # Unisoc (Spreadtrum)
+    "splloader", "uboot", "uboot_log", "sml", "tos", "teecfg", "fdl1", "fdl2",
+    # HiSilicon Kirin
+    "xloader", "hisee_img", "fastboot",
 }
 
 FIRMWARE_PARTITIONS = {
-    "apusys", "cam_vpu1", "cam_vpu2", "cam_vpu3", "ccu", "connsys_bt",
-    "connsys_gnss", "connsys_wifi", "dpm", "gpueb", "gz", "logo",
-    "mcf_ota", "mcupm", "md1img", "mvpu_algo", "pi_img",
-    "scp", "spmfw", "sspm", "tee", "tkv", "vcp",
-    "modem", "bluetooth", "dsp", "aop", "devcfg", "featenabler",
-    "imagefv", "keymaster", "qupfw", "shrm", "storsec", "uefisecapp",
+    # MediaTek (MTK)
+    "apusys", "audio_dsp", "cam_vpu1", "cam_vpu2", "cam_vpu3", "ccu",
+    "connsys_bt", "connsys_gnss", "connsys_wifi", "dpm", "gpueb", "gz",
+    "logo", "mcf_ota", "mcupm", "md1img", "mvpu_algo", "pi_img",
+    "scp", "spmfw", "sspm", "tee", "tkv", "vcp", "vpu", "spu",
+    # Qualcomm (QCOM)
+    "modem", "bluetooth", "dsp", "aop", "aop_config", "devcfg",
+    "featenabler", "imagefv", "keymaster", "multiimgoem", "qupfw",
+    "shrm", "storsec", "uefisecapp", "cpucp", "cpucp_dtb", "vm-bootsys",
+    "qmcs", "engineering_cdt", "oplusstanvbk", "splash",
+    # Exynos / Tensor
+    "radio", "harx", "keystorage", "tzar", "dqmdbg", "acpm",
+    # Unisoc
+    "l_modem", "l_ldsp", "l_gdsp", "l_agdsp", "l_cdsp", "l_fixnv1",
+    "l_fixnv2", "pm_sys", "wcnmodem", "gnssmodem",
 }
 
 _ZSTD_LV_BYTES_RE = re.compile(r"Decompressed Size\s*:\s*.*?\((\d+)\s*B\)", re.IGNORECASE)
@@ -347,6 +368,54 @@ def _parse_prop_file(fpath: str, result: Dict[str, str]) -> None:
         pass
 
 
+def _batch_zstd_uncompressed_sizes(
+    zstd_items: List[Tuple[str, str, str, int, bytes]],
+    zstd_bin: Optional[str],
+) -> Dict[str, int]:
+    """Resolve uncompressed sizes for many .zst files in a single zstd -lv invocation."""
+    resolved: Dict[str, int] = {}
+    if not zstd_bin or len(zstd_items) < 2:
+        return resolved
+
+    chunk_size = 64
+    for start in range(0, len(zstd_items), chunk_size):
+        batch = zstd_items[start : start + chunk_size]
+        path_to_base = {
+            os.path.normcase(os.path.abspath(fpath)): base
+            for base, fpath, _fname, _fsz, _head in batch
+        }
+        paths = [fpath for _base, fpath, _fname, _fsz, _head in batch]
+        try:
+            proc = subprocess.run(
+                [zstd_bin, "-lv"] + paths,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                **subprocess_flags(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+
+        cur_base: Optional[str] = None
+        for raw_line in (proc.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                cur_base = None
+                continue
+            key = os.path.normcase(os.path.abspath(line))
+            if key in path_to_base:
+                cur_base = path_to_base[key]
+                continue
+            if cur_base is not None:
+                m = _ZSTD_LV_BYTES_RE.search(line)
+                if m:
+                    val = int(m.group(1))
+                    if val > 0:
+                        resolved[cur_base] = val
+    return resolved
+
+
 def scan_folder(
     directory: str,
     zstd_bin: Optional[str] = None,
@@ -412,18 +481,19 @@ def scan_folder(
         unique_items.append((base, fpath, fname, file_size, head))
 
     zstd_items = [item for item in unique_items if _is_zstd_magic(item[4])]
-    zstd_sizes: Dict[str, int] = {}
-    if len(zstd_items) > 1:
-        workers = min(len(zstd_items), max(2, os.cpu_count() or 4))
+    zstd_sizes: Dict[str, int] = _batch_zstd_uncompressed_sizes(zstd_items, resolved_zstd)
+    missing_zstd = [item for item in zstd_items if item[0] not in zstd_sizes]
+    if len(missing_zstd) > 1:
+        workers = min(len(missing_zstd), max(2, os.cpu_count() or 4))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {
                 ex.submit(get_zstd_uncompressed_size, fpath, resolved_zstd, head): base
-                for base, fpath, _fname, _fsz, head in zstd_items
+                for base, fpath, _fname, _fsz, head in missing_zstd
             }
             for fut, base in futs.items():
                 zstd_sizes[base] = fut.result()
-    elif len(zstd_items) == 1:
-        base, fpath, _fname, _fsz, head = zstd_items[0]
+    elif len(missing_zstd) == 1:
+        base, fpath, _fname, _fsz, head = missing_zstd[0]
         zstd_sizes[base] = get_zstd_uncompressed_size(fpath, resolved_zstd, head)
 
     found: Dict[str, PartitionImage] = {}

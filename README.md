@@ -8,21 +8,23 @@ Requires Python 3.8 or newer. No external Python packages are needed.
 
 - Packages `.img`, Android sparse `.img`, and `.img.zst` files into a clean recovery flashable ZIP (`META-INF/com/google/android/update-binary`).
 - Automatically detects Android sparse images and streams unsparsed blocks directly into `zstd` without writing multi-GB temporary raw images to disk.
-- Reads Zstandard uncompressed partition sizes directly from RFC 8878 frame headers in a single file open (no slow full-file scan).
+- Reads Zstandard uncompressed partition sizes in one batched `zstd -lv` pass (with multi-frame, streaming, and RFC 8878 header fallbacks).
 - Compresses small images in parallel and saturates CPU cores across large partitions with `zstd` (XXH64 checksums enabled), storing `.img.zst` entries uncompressed inside the ZIP so archives are never double-compressed.
 - Streams unchanged `.img.zst` and raw `.img` files directly into the ZIP using a reusable 16 MiB I/O buffer without extra temporary copies.
 - Names output packages cleanly as `Codename-Version-Flashable.zip` (for example, `X6871-1.0-Flashable.zip`; falls back to `Device-Version-Flashable.zip` if Codename is left blank).
-- Hardened recovery install flow for TWRP, OrangeFox, PBRP, and Lineage Recovery:
-  - Matches device codenames across OEM prefixes (for example, `Infinix-X6871` matches `X6871`) and accepts comma-separated codenames.
-  - Dynamically unmounts `/proc/mounts` device-mapper entries before editing `super`.
-  - Only clears and recreates the dynamic partitions included in the ZIP, removes group size caps with `lptools unlimited-group`, and checks `lptools free` before touching `boot`, `vbmeta`, or firmware.
+- Universal custom recovery install flow for TWRP, OrangeFox, PBRP, and Lineage Recovery across MediaTek, Qualcomm, Exynos, Tensor, Unisoc, and Kirin devices:
+  - Probes working `unzip` (`unzip` / `/system/bin/unzip` / `/sbin/unzip` / `busybox unzip`), handles `OUTFD` fallback and ADB sideload `/sideload/package.zip`.
+  - Detects active slot across `ro.boot.slot_suffix`, `ro.boot.slot`, and `/proc/cmdline` (`androidboot.slot_suffix` / `androidboot.slot`) and prints the detected SoC platform.
+  - Supports Dynamic Virtual A/B, Dynamic A/B, Dynamic A-only, Retrofit Dynamic (`ro.boot.super_partition`), hybrid physical OEM partitions (`cust`, `prism`, `optics`), and automatic Static GPT fallback on non-dynamic devices.
+  - Dynamically unmounts `/proc/mounts` device-mapper entries, detects pending Virtual A/B snapshot merges (`clear-cow` + `snapshotctl`), uses `dmctl` unmap fallback, aligns logical partition sizes to 4096-byte sectors, creates `/dev/block/by-name` compatibility symlinks when missing, and checks `lptools free` before touching `boot`, `vbmeta`, or firmware.
+  - Only clears and recreates the dynamic partitions included in the ZIP, and removes group size caps with `lptools unlimited-group`.
   - Orders ZIP entries so `META-INF/` and small boot/firmware images stay below the 4 GiB ZIP64 boundary before large dynamic images.
-  - Unlocks read-only block devices (`blockdev --setrw` and UFS `force_ro`) and verifies target partition capacity before writing.
+  - Discovers block devices across all SoC platform trees (`/dev/block/by-name`, `bootdevice`, MTK/QCOM/Exynos/Tensor/Unisoc platform paths, eMMC `mmcblk0boot0`/`boot1`, and deep `find` fallback), unlocks `blockdev --setrw` and `force_ro` (UFS LUNs and eMMC partitions), and verifies partition capacity before writing.
   - Reports byte-weighted recovery progress and total flash time.
-- Separates low-level bootloader images (`preloader_raw`, `lk`, `xbl`, `abl`, etc.) so you can skip them in one click (`Skip Bootloader` in GUI).
+- Separates low-level bootloader images across all SoCs (`preloader_raw`, `lk`, `xbl`, `abl`, `sboot`, `splloader`, `uboot`, etc.) so you can skip them in one click (`Skip Bootloader` in GUI).
 - Supports AVB 2.0 `skip`, `disable`, and `enable` modes both inside full ROM packages and as standalone flashable ZIPs:
-  - Patches top-level `vbmeta` flags only (leaves chained `vbmeta_system` and `vbmeta_vendor` at 0 so `libavb` does not reject them).
-  - Runs live `avbctl get-verity` / `get-verification` status checks on device before applying `--force disable/enable-verity` and `--force disable/enable-verification`, with automatic direct `AVB0` header fallback if `avbctl` is unavailable in recovery.
+  - Patches top-level `vbmeta` flags only (leaves chained `vbmeta_system`, `vbmeta_vendor`, and `vbmeta_*_dlkm` at 0 so `libavb` does not reject them).
+  - Runs live `avbctl get-verity` / `get-verification` status checks on device before applying `--force disable/enable-verity` and `--force disable/enable-verification`, syncs the inactive A/B `vbmeta` slot, and falls back to direct `AVB0` header patching if `avbctl` is unavailable in recovery.
 - Probes bundled binaries before using them and falls back to system `zstd` or Python `zstandard` automatically on any CPU or OS.
 
 ## Quick Start
@@ -76,7 +78,7 @@ chmod +x run_termux.sh
    - ZSTD Level `1` gives the best balance of build speed and ZIP size. Set `0` to pack raw `.img` files.
    - ZIP Level applies to scripts when ZSTD is enabled, or to raw `.img` files when ZSTD is `0`.
 5. Check the **Output Folder** (type/paste a path or click **Browse...**) and the live `Codename-Version-Flashable.zip` filename preview.
-6. Click **Preview Script** to inspect or copy the generated `update-binary` before building.
+6. Click **Preview Script** (`Ctrl+P`) to inspect, copy, or save the generated `update-binary` before building.
 7. Click **Build Flashable ZIP** (`Ctrl+B`).
 
 ## CLI Usage
